@@ -8,7 +8,7 @@
 - `ckpt/<name>/train|export|index/`：训练日志、导出模型和索引
 - `ckpt/<name>/config.yaml`：训练入口生成的可重放任务快照
 - `configs/base.yaml` + `configs/<task>.yaml`：SOAP 风格配置入口
-- `infer/index/`：索引构建和权重辅助脚本
+- `src/`：训练、预处理、索引构建、离线推理和共享模型组件的新入口
 
 ## 环境准备
 
@@ -67,48 +67,48 @@ pip install -r requirements.txt
 预处理：
 
 ```bash
-python infer/modules/train/preprocess.py --config configs/mute.yaml
+python -m src.preprocess --config configs/mute.yaml
 ```
 
 带覆盖的预处理：
 
 ```bash
-python infer/modules/train/preprocess.py --config configs/mute.yaml --hparams dataset_dir=data/mute/dataset,preprocess_dir=data/mute/preprocess_data_smoke,preprocess.noparallel=true,runtime.n_cpu=1
+python -m src.preprocess --config configs/mute.yaml --hparams dataset_dir=data/mute/dataset,preprocess_dir=data/mute/preprocess_data_smoke,preprocess.noparallel=true,runtime.n_cpu=1
 ```
 
 训练：
 
 ```bash
-python infer/modules/train/train.py --config configs/mute.yaml
+python -m src.train --config configs/mute.yaml
 ```
 
 切换 selector：
 
 ```bash
-python infer/modules/train/train.py --config configs/mute.yaml --hparams selectors.version=v2,selectors.sample_rate=48k
+python -m src.train --config configs/mute.yaml --hparams selectors.version=v2,selectors.sample_rate=48k
 ```
 
 忽略已有快照重新解析：
 
 ```bash
-python infer/modules/train/train.py --config configs/mute.yaml --reset
+python -m src.train --config configs/mute.yaml --reset
 ```
 
 构建索引：
 
 ```bash
 # v1 / 256-dim
-python infer/index/train-index.py --config configs/mute.yaml
+python -m src.index.build_v1 --config configs/mute.yaml
 
 # v2 / 768-dim
-python infer/index/train-index-v2.py --config configs/mute.yaml --hparams selectors.version=v2,selectors.sample_rate=48k
+python -m src.index.build_v2 --config configs/mute.yaml --hparams selectors.version=v2,selectors.sample_rate=48k
 ```
 
 手工路径模式仍保留：
 
 ```bash
-python infer/modules/train/preprocess.py -i data/mute/dataset -o data/mute/preprocess_data_manual -sr 48000 -n 1 --per 3.7 --noparallel
-python infer/index/train-index.py -i data/mute/preprocess_data/3_feature256 -o ckpt/mute/index/mute.index
+python -m src.preprocess -i data/mute/dataset -o data/mute/preprocess_data_manual -sr 48000 -n 1 --per 3.7 --noparallel
+python -m src.index.build_v1 -i data/mute/preprocess_data/3_feature256 -o ckpt/mute/index/mute.index
 ```
 
 ## 输出位置
