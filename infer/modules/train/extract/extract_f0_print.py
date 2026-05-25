@@ -17,6 +17,7 @@ logging.getLogger("numba").setLevel(logging.WARNING)
 from multiprocessing import Process
 
 exp_dir = sys.argv[1]
+pretrain_root = os.getenv("pretrain_root", "pretrain")
 f = open("%s/extract_f0_feature.log" % exp_dir, "a+")
 
 
@@ -87,7 +88,9 @@ class FeatureInput(object):
 
                 print("Loading rmvpe model")
                 self.model_rmvpe = RMVPE(
-                    "assets/rmvpe/rmvpe.pt", is_half=False, device="cpu"
+                    os.path.join(pretrain_root, "rmvpe", "rmvpe.pt"),
+                    is_half=False,
+                    device="cpu",
                 )
             f0 = self.model_rmvpe.infer_from_audio(x, thred=0.03)
         return f0

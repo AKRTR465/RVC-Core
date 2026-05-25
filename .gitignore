@@ -22,22 +22,14 @@ tools/aria2c/
 tools/flag.txt
 
 # Downloaded model resources
-/assets/hubert/*
-!/assets/hubert/.gitignore
-/assets/rmvpe/*
-!/assets/rmvpe/.gitignore
-/assets/pretrained/*
-!/assets/pretrained/.gitignore
-/assets/pretrained_v2/*
-!/assets/pretrained_v2/.gitignore
+/pretrain/*
+!/pretrain/.gitignore
 
-# Generated indexes and weights
-/assets/indices/*
-!/assets/indices/.gitignore
-/assets/weights/*
-!/assets/weights/.gitignore
-/weights/
-/logs/
+# Project data and checkpoints
+/data/*
+!/data/.gitignore
+/ckpt/*
+!/ckpt/.gitignore
 
 # Legacy root-level downloads
 /pretrained/

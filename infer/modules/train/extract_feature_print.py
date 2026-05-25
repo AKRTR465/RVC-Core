@@ -33,7 +33,8 @@ def printt(strr):
 
 
 printt(" ".join(sys.argv))
-model_path = "assets/hubert/hubert_base.pt"
+pretrain_root = os.getenv("pretrain_root", "pretrain")
+model_path = os.path.join(pretrain_root, "hubert", "hubert_base.pt")
 
 printt("exp_dir: " + exp_dir)
 wavPath = "%s/1_16k_wavs" % exp_dir

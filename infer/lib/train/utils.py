@@ -1,15 +1,22 @@
 import argparse
+import copy
 import glob
-import json
 import logging
 import os
 import subprocess
 import sys
 import shutil
+from pathlib import Path
 
 import numpy as np
 import torch
 from scipy.io.wavfile import read
+
+from configs.project_config import (
+    load_project_config,
+    parse_hparams_overrides,
+    save_project_config_snapshot,
+)
 
 MATPLOTLIB_FLAG = False
 
@@ -288,6 +295,124 @@ def load_filepaths_and_text(filename, split="|"):
     return filepaths_and_text
 
 
+def _first_not_empty(*values):
+    for value in values:
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _required_value(field_name, value):
+    if value in (None, ""):
+        raise ValueError(f"Missing required training setting: {field_name}")
+    return value
+
+
+def _normalize_save_every_weights(value):
+    if value in (None, ""):
+        return "0"
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, (int, float)):
+        return "1" if int(value) != 0 else "0"
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return "1"
+    return "0"
+
+
+def _sync_train_aliases(config):
+    train = config["train"]
+    config["save_every_epoch"] = int(train["save_every_epoch"])
+    config["total_epoch"] = int(train["epochs"])
+    config["pretrainG"] = train.get("pretrainG", "")
+    config["pretrainD"] = train.get("pretrainD", "")
+    config["if_latest"] = int(train["if_latest"])
+    config["if_cache_data_in_gpu"] = int(train["if_cache_data_in_gpu"])
+    config["save_every_weights"] = _normalize_save_every_weights(
+        train.get("save_every_weights")
+    )
+
+
+def _apply_training_cli_overrides(config, args):
+    train = config["train"]
+    replayable_train = config.get("replayable_config", {}).get("train")
+
+    train["save_every_epoch"] = int(
+        _required_value(
+            "save_every_epoch",
+            _first_not_empty(args.save_every_epoch, train.get("save_every_epoch")),
+        )
+    )
+    train["epochs"] = int(
+        _required_value(
+            "total_epoch",
+            _first_not_empty(args.total_epoch, train.get("epochs")),
+        )
+    )
+    train["pretrainG"] = (
+        args.pretrainG if args.pretrainG != "" else train.get("pretrainG", "") or ""
+    )
+    train["pretrainD"] = (
+        args.pretrainD if args.pretrainD != "" else train.get("pretrainD", "") or ""
+    )
+    train["if_latest"] = int(
+        _required_value(
+            "if_latest",
+            _first_not_empty(args.if_latest, train.get("if_latest")),
+        )
+    )
+    train["if_cache_data_in_gpu"] = int(
+        _required_value(
+            "if_cache_data_in_gpu",
+            _first_not_empty(args.if_cache_data_in_gpu, train.get("if_cache_data_in_gpu")),
+        )
+    )
+    train["save_every_weights"] = (
+        _normalize_save_every_weights(
+            _first_not_empty(
+                args.save_every_weights,
+                train.get("save_every_weights"),
+                "0",
+            )
+        )
+        == "1"
+    )
+    train["batch_size"] = int(
+        _required_value(
+            "batch_size",
+            _first_not_empty(args.batch_size, train.get("batch_size")),
+        )
+    )
+
+    if isinstance(replayable_train, dict):
+        replayable_train["save_every_epoch"] = train["save_every_epoch"]
+        replayable_train["epochs"] = train["epochs"]
+        replayable_train["pretrainG"] = train["pretrainG"]
+        replayable_train["pretrainD"] = train["pretrainD"]
+        replayable_train["if_latest"] = train["if_latest"]
+        replayable_train["if_cache_data_in_gpu"] = train["if_cache_data_in_gpu"]
+        replayable_train["save_every_weights"] = train["save_every_weights"]
+        replayable_train["batch_size"] = train["batch_size"]
+
+    config["gpus"] = args.gpus
+    _sync_train_aliases(config)
+    return config
+
+
+def _snapshot_path_for_project(config):
+    return Path(config["work_dir"]) / "config.yaml"
+
+
+def _build_hparams(config):
+    hparams = HParams(**config)
+    hparams.model_dir = config["train_dir"]
+    hparams.experiment_dir = config["work_dir"]
+    hparams.gpus = config.get("gpus", "0")
+    hparams.data.training_files = config["training_files"]
+    return hparams
+
+
 def get_hparams(init=True):
     """
     todo:
@@ -310,11 +435,11 @@ def get_hparams(init=True):
         "-se",
         "--save_every_epoch",
         type=int,
-        required=True,
+        default=None,
         help="checkpoint save frequency (epoch)",
     )
     parser.add_argument(
-        "-te", "--total_epoch", type=int, required=True, help="total_epoch"
+        "-te", "--total_epoch", type=int, default=None, help="total_epoch"
     )
     parser.add_argument(
         "-pg", "--pretrainG", type=str, default="", help="Pretrained Generator path"
@@ -324,14 +449,16 @@ def get_hparams(init=True):
     )
     parser.add_argument("-g", "--gpus", type=str, default="0", help="split by -")
     parser.add_argument(
-        "-bs", "--batch_size", type=int, required=True, help="batch size"
+        "-bs", "--batch_size", type=int, default=None, help="batch size"
     )
+    parser.add_argument("--config", type=str, default="", help="task config path or name")
     parser.add_argument(
-        "-e", "--experiment_dir", type=str, required=True, help="experiment dir"
-    )  # -m
-    parser.add_argument(
-        "-sr", "--sample_rate", type=str, required=True, help="sample rate, 32k/40k/48k"
+        "--hparams",
+        type=str,
+        default="",
+        help="comma-separated scalar overrides, e.g. train.batch_size=1",
     )
+    parser.add_argument("--reset", action="store_true", help="ignore work_dir/config.yaml")
     parser.add_argument(
         "-sw",
         "--save_every_weights",
@@ -340,75 +467,53 @@ def get_hparams(init=True):
         help="save the extracted model in weights directory when saving checkpoints",
     )
     parser.add_argument(
-        "-v", "--version", type=str, required=True, help="model version"
-    )
-    parser.add_argument(
-        "-f0",
-        "--if_f0",
-        type=int,
-        required=True,
-        help="use f0 as one of the inputs of the model, 1 or 0",
-    )
-    parser.add_argument(
         "-l",
         "--if_latest",
         type=int,
-        required=True,
+        default=None,
         help="if only save the latest G/D pth file, 1 or 0",
     )
     parser.add_argument(
         "-c",
         "--if_cache_data_in_gpu",
         type=int,
-        required=True,
+        default=None,
         help="if caching the dataset in GPU memory, 1 or 0",
     )
 
     args = parser.parse_args()
-    name = args.experiment_dir
-    experiment_dir = os.path.join("./logs", args.experiment_dir)
+    if args.config == "":
+        raise ValueError("Please provide --config.")
 
-    config_save_path = os.path.join(experiment_dir, "config.json")
-    with open(config_save_path, "r") as f:
-        config = json.load(f)
+    project_config = load_project_config(
+        args.config,
+        overrides=parse_hparams_overrides(args.hparams),
+        reset=args.reset,
+    )
+    config = copy.deepcopy(project_config)
 
-    hparams = HParams(**config)
-    hparams.model_dir = hparams.experiment_dir = experiment_dir
-    hparams.save_every_epoch = args.save_every_epoch
-    hparams.name = name
-    hparams.total_epoch = args.total_epoch
-    hparams.pretrainG = args.pretrainG
-    hparams.pretrainD = args.pretrainD
-    hparams.version = args.version
-    hparams.gpus = args.gpus
-    hparams.train.batch_size = args.batch_size
-    hparams.sample_rate = args.sample_rate
-    hparams.if_f0 = args.if_f0
-    hparams.if_latest = args.if_latest
-    hparams.save_every_weights = args.save_every_weights
-    hparams.if_cache_data_in_gpu = args.if_cache_data_in_gpu
-    hparams.data.training_files = "%s/filelist.txt" % experiment_dir
-    return hparams
+    config.setdefault("data", {})
+    config["data"]["training_files"] = project_config["training_files"]
+    config = _apply_training_cli_overrides(config, args)
+
+    config_save_path = _snapshot_path_for_project(config)
+    if args.reset or not config_save_path.exists():
+        save_project_config_snapshot(config, config_save_path)
+
+    return _build_hparams(config)
 
 
 def get_hparams_from_dir(model_dir):
-    config_save_path = os.path.join(model_dir, "config.json")
-    with open(config_save_path, "r") as f:
-        data = f.read()
-    config = json.loads(data)
-
-    hparams = HParams(**config)
-    hparams.model_dir = model_dir
-    return hparams
+    model_dir_path = Path(model_dir)
+    config_save_path = model_dir_path.parent / "config.yaml"
+    config = load_project_config(config_save_path, reset=True)
+    return _build_hparams(config)
 
 
 def get_hparams_from_file(config_path):
-    with open(config_path, "r") as f:
-        data = f.read()
-    config = json.loads(data)
-
-    hparams = HParams(**config)
-    return hparams
+    path = Path(config_path)
+    config = load_project_config(path, reset=path.name == "config.yaml")
+    return _build_hparams(config)
 
 
 def check_git_hash(model_dir):

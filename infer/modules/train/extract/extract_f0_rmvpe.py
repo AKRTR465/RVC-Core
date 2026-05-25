@@ -20,7 +20,8 @@ i_part = int(sys.argv[2])
 i_gpu = sys.argv[3]
 os.environ["CUDA_VISIBLE_DEVICES"] = str(i_gpu)
 exp_dir = sys.argv[4]
-is_half = sys.argv[5]
+is_half = sys.argv[5].lower() == "true"
+pretrain_root = os.getenv("pretrain_root", "pretrain")
 f = open("%s/extract_f0_feature.log" % exp_dir, "a+")
 
 
@@ -50,7 +51,9 @@ class FeatureInput(object):
 
                 print("Loading rmvpe model")
                 self.model_rmvpe = RMVPE(
-                    "assets/rmvpe/rmvpe.pt", is_half=is_half, device="cuda"
+                    os.path.join(pretrain_root, "rmvpe", "rmvpe.pt"),
+                    is_half=is_half,
+                    device="cuda",
                 )
             f0 = self.model_rmvpe.infer_from_audio(x, thred=0.03)
         return f0

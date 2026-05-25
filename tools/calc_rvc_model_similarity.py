@@ -2,6 +2,7 @@
 # Fill in the path of the model to be queried and the root directory of the reference models, and this script will return the similarity between the model to be queried and all reference models.
 import os
 import logging
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -72,8 +73,12 @@ def main(path, root):
 
     del model_a
 
-    for name in sorted(list(os.listdir(root))):
-        path = "%s/%s" % (root, name)
+    for path in sorted(
+        candidate
+        for candidate in Path(root).rglob("*.pth")
+        if candidate.is_file() and "export" in candidate.parts
+    ):
+        path = str(path)
         model_b = torch.load(path, map_location="cpu")["weight"]
 
         sims = []
@@ -91,6 +96,6 @@ def main(path, root):
 
 
 if __name__ == "__main__":
-    query_path = r"assets\weights\mi v3.pth"
-    reference_root = r"assets\weights"
+    query_path = r"ckpt\mi v3\export\mi v3.pth"
+    reference_root = r"ckpt"
     main(query_path, reference_root)

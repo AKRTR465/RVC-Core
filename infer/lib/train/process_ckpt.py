@@ -2,8 +2,26 @@ import os
 import sys
 import traceback
 from collections import OrderedDict
+from pathlib import Path
 
 import torch
+
+def _guess_project_name(name):
+    stem = Path(name).stem
+    if "_e" in stem and "_s" in stem:
+        return stem.split("_e", 1)[0]
+    return stem
+
+
+def _export_path(name, suffix=".pth", hps=None):
+    filename = name if name.endswith(suffix) else f"{name}{suffix}"
+    if hps is not None and getattr(hps, "export_dir", None):
+        export_dir = Path(hps.export_dir)
+    else:
+        export_dir = Path(os.getenv("ckpt_root", "ckpt")) / _guess_project_name(name) / "export"
+    export_dir.mkdir(parents=True, exist_ok=True)
+    return export_dir / filename
+
 
 def savee(ckpt, sr, if_f0, name, epoch, version, hps):
     try:
@@ -37,7 +55,7 @@ def savee(ckpt, sr, if_f0, name, epoch, version, hps):
         opt["sr"] = sr
         opt["f0"] = if_f0
         opt["version"] = version
-        torch.save(opt, "assets/weights/%s.pth" % name)
+        torch.save(opt, _export_path(name, hps=hps))
         return "Success."
     except:
         return traceback.format_exc()
@@ -180,7 +198,7 @@ def extract_small_model(path, name, sr, if_f0, info, version):
         opt["version"] = version
         opt["sr"] = sr
         opt["f0"] = int(if_f0)
-        torch.save(opt, "assets/weights/%s.pth" % name)
+        torch.save(opt, _export_path(name))
         return "Success."
     except:
         return traceback.format_exc()
@@ -192,7 +210,7 @@ def change_info(path, info, name):
         ckpt["info"] = info
         if name == "":
             name = os.path.basename(path)
-        torch.save(ckpt, "assets/weights/%s" % name)
+        torch.save(ckpt, _export_path(name, suffix=""))
         return "Success."
     except:
         return traceback.format_exc()
@@ -264,7 +282,7 @@ def merge(path1, path2, alpha1, sr, f0, info, name, version):
         opt["f0"] = _normalize_f0_flag(f0)
         opt["version"] = version
         opt["info"] = info
-        torch.save(opt, "assets/weights/%s.pth" % name)
+        torch.save(opt, _export_path(name))
         return "Success."
     except:
         return traceback.format_exc()

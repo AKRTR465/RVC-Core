@@ -19,10 +19,10 @@ if errorlevel 1 (
 echo working dir is %ROOT%
 echo dir check start.
 
-if not exist "%ROOT%\assets\pretrained" mkdir "%ROOT%\assets\pretrained"
-if not exist "%ROOT%\assets\pretrained_v2" mkdir "%ROOT%\assets\pretrained_v2"
-if not exist "%ROOT%\assets\hubert" mkdir "%ROOT%\assets\hubert"
-if not exist "%ROOT%\assets\rmvpe" mkdir "%ROOT%\assets\rmvpe"
+if not exist "%ROOT%\pretrain\pretrained" mkdir "%ROOT%\pretrain\pretrained"
+if not exist "%ROOT%\pretrain\pretrained_v2" mkdir "%ROOT%\pretrain\pretrained_v2"
+if not exist "%ROOT%\pretrain\hubert" mkdir "%ROOT%\pretrain\hubert"
+if not exist "%ROOT%\pretrain\rmvpe" mkdir "%ROOT%\pretrain\rmvpe"
 
 echo dir check finished.
 echo required files check start.
@@ -47,15 +47,15 @@ exit /b 0
 set "SUBDIR=%~1"
 set "NAME=%~2"
 set "REMOTE=%~3"
-set "TARGET=%ROOT%\assets\%SUBDIR%\%NAME%"
+set "TARGET=%ROOT%\pretrain\%SUBDIR%\%NAME%"
 echo checking %NAME%
 if exist "%TARGET%" (
-    echo %NAME% in assets\%SUBDIR% checked.
+    echo %NAME% in pretrain\%SUBDIR% checked.
     exit /b 0
 )
 
 echo downloading %NAME%
-%ARIA2% --console-log-level=error -c -x 16 -s 16 -k 1M "https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/%REMOTE%" -d "%ROOT%\assets\%SUBDIR%" -o "%NAME%"
+%ARIA2% --console-log-level=error -c -x 16 -s 16 -k 1M "https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/%REMOTE%" -d "%ROOT%\pretrain\%SUBDIR%" -o "%NAME%"
 if exist "%TARGET%" (
     echo download successful.
     exit /b 0

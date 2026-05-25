@@ -21,10 +21,10 @@ check_dir() {
     printf "failed. generating dir %s\n" "$1" && mkdir -p "$1"
 }
 
-check_dir "$ROOT_DIR/assets/pretrained"
-check_dir "$ROOT_DIR/assets/pretrained_v2"
-check_dir "$ROOT_DIR/assets/hubert"
-check_dir "$ROOT_DIR/assets/rmvpe"
+check_dir "$ROOT_DIR/pretrain/pretrained"
+check_dir "$ROOT_DIR/pretrain/pretrained_v2"
+check_dir "$ROOT_DIR/pretrain/hubert"
+check_dir "$ROOT_DIR/pretrain/rmvpe"
 
 echo "dir check finished."
 
@@ -32,23 +32,23 @@ echo "required files check start."
 
 check_file_pretrained() {
   printf "checking %s\n" "$2"
-  if [ -f "$ROOT_DIR/assets/$1/$2" ]; then
-      printf "%s in ./assets/%s checked.\n" "$2" "$1"
+  if [ -f "$ROOT_DIR/pretrain/$1/$2" ]; then
+      printf "%s in ./pretrain/%s checked.\n" "$2" "$1"
   else
       echo failed. starting download from huggingface.
-      aria2c --console-log-level=error -c -x 16 -s 16 -k 1M "https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/$1/$2" -d "$ROOT_DIR/assets/$1" -o "$2"
-      [ -f "$ROOT_DIR/assets/$1/$2" ] && echo "download successful." || { echo "please try again!" && exit 1; }
+      aria2c --console-log-level=error -c -x 16 -s 16 -k 1M "https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/$1/$2" -d "$ROOT_DIR/pretrain/$1" -o "$2"
+      [ -f "$ROOT_DIR/pretrain/$1/$2" ] && echo "download successful." || { echo "please try again!" && exit 1; }
   fi
 }
 
 check_file_special() {
   printf "checking %s\n" "$2"
-  if [ -f "$ROOT_DIR/assets/$1/$2" ]; then
-      printf "%s in ./assets/%s checked.\n" "$2" "$1"
+  if [ -f "$ROOT_DIR/pretrain/$1/$2" ]; then
+      printf "%s in ./pretrain/%s checked.\n" "$2" "$1"
   else
       echo failed. starting download from huggingface.
-      aria2c --console-log-level=error -c -x 16 -s 16 -k 1M "https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/$2" -d "$ROOT_DIR/assets/$1" -o "$2"
-      [ -f "$ROOT_DIR/assets/$1/$2" ] && echo "download successful." || { echo "please try again!" && exit 1; }
+      aria2c --console-log-level=error -c -x 16 -s 16 -k 1M "https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/$2" -d "$ROOT_DIR/pretrain/$1" -o "$2"
+      [ -f "$ROOT_DIR/pretrain/$1/$2" ] && echo "download successful." || { echo "please try again!" && exit 1; }
   fi
 }
 

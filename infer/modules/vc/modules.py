@@ -97,7 +97,9 @@ class VC:
                 "",
                 "",
             )
-        person = f'{os.getenv("weight_root")}/{sid}'
+        person = get_model_path_from_sid(sid, self.config.ckpt_root)
+        if person == "":
+            raise FileNotFoundError(f"Model not found under {self.config.ckpt_root}: {sid}")
         logger.info(f"Loading: {person}")
 
         self.cpt = torch.load(person, map_location="cpu")
@@ -128,7 +130,10 @@ class VC:
 
         self.pipeline = Pipeline(self.tgt_sr, self.config)
         n_spk = self.cpt["config"][-3]
-        index = {"value": get_index_path_from_model(sid), "__type__": "update"}
+        index = {
+            "value": get_index_path_from_model(sid, self.config.ckpt_root),
+            "__type__": "update",
+        }
         logger.info("Select index: " + index["value"])
 
         return (

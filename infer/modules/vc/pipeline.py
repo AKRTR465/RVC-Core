@@ -80,6 +80,13 @@ class Pipeline(object):
         self.t_center = self.sr * self.x_center  # 查询切点位置
         self.t_max = self.sr * self.x_max  # 免查询时长阈值
         self.device = config.device
+        self.rmvpe_path = getattr(
+            config,
+            "rmvpe_path",
+            os.path.join(
+                getattr(config, "pretrain_root", "pretrain"), "rmvpe", "rmvpe.pt"
+            ),
+        )
 
     def get_f0(
         self,
@@ -143,11 +150,9 @@ class Pipeline(object):
             if not hasattr(self, "model_rmvpe"):
                 from infer.lib.rmvpe import RMVPE
 
-                logger.info(
-                    "Loading rmvpe model,%s" % "%s/rmvpe.pt" % os.environ["rmvpe_root"]
-                )
+                logger.info("Loading rmvpe model,%s", self.rmvpe_path)
                 self.model_rmvpe = RMVPE(
-                    "%s/rmvpe.pt" % os.environ["rmvpe_root"],
+                    self.rmvpe_path,
                     is_half=self.is_half,
                     device=self.device,
                 )

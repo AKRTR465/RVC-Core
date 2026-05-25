@@ -18,7 +18,7 @@ def dl_model(link, model_name, dir_name):
 
 if __name__ == "__main__":
     print("Downloading hubert_base.pt...")
-    dl_model(RVC_DOWNLOAD_LINK, "hubert_base.pt", BASE_DIR / "assets/hubert")
+    dl_model(RVC_DOWNLOAD_LINK, "hubert_base.pt", BASE_DIR / "pretrain/hubert")
     print("Downloading rmvpe.pt...")
-    dl_model(RVC_DOWNLOAD_LINK, "rmvpe.pt", BASE_DIR / "assets/rmvpe")
+    dl_model(RVC_DOWNLOAD_LINK, "rmvpe.pt", BASE_DIR / "pretrain/rmvpe")
     print('All models downloaded!')
