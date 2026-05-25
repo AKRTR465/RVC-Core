@@ -1,4 +1,4 @@
-﻿# RVC Core
+# RVC Core
 
 这个仓库保留了 RVC 的训练、索引构建、离线推理和模型处理链路，当前目录布局已经统一为：
 
@@ -8,6 +8,7 @@
 - `ckpt/<name>/train|export|index/`：训练日志、导出模型和索引
 - `ckpt/<name>/config.yaml`：训练入口生成的可重放任务快照
 - `configs/base.yaml` + `configs/<task>.yaml`：SOAP 风格配置入口
+- `infer/index/`：索引构建和权重辅助脚本
 
 ## 环境准备
 
@@ -97,17 +98,17 @@ python infer/modules/train/train.py --config configs/mute.yaml --reset
 
 ```bash
 # v1 / 256-dim
-python tools/infer/train-index.py --config configs/mute.yaml
+python infer/index/train-index.py --config configs/mute.yaml
 
 # v2 / 768-dim
-python tools/infer/train-index-v2.py --config configs/mute.yaml --hparams selectors.version=v2,selectors.sample_rate=48k
+python infer/index/train-index-v2.py --config configs/mute.yaml --hparams selectors.version=v2,selectors.sample_rate=48k
 ```
 
 手工路径模式仍保留：
 
 ```bash
 python infer/modules/train/preprocess.py -i data/mute/dataset -o data/mute/preprocess_data_manual -sr 48000 -n 1 --per 3.7 --noparallel
-python tools/infer/train-index.py -i data/mute/preprocess_data/3_feature256 -o ckpt/mute/index/mute.index
+python infer/index/train-index.py -i data/mute/preprocess_data/3_feature256 -o ckpt/mute/index/mute.index
 ```
 
 ## 输出位置
@@ -118,15 +119,14 @@ python tools/infer/train-index.py -i data/mute/preprocess_data/3_feature256 -o c
 
 只有训练入口会生成或刷新 `ckpt/<name>/config.yaml`；preprocess、index 和纯解析模式只读不写。
 
-## 模型资源下载
+## 预训练资源准备
 
-```bash
-python tools/download_models.py
-```
+请手动准备以下运行时资源：
 
-或使用：
+- `pretrain/hubert/hubert_base.pt`
+- `pretrain/rmvpe/rmvpe.pt`
 
-```bash
-tools/dlmodels.bat
-tools/dlmodels.sh
-```
+如需使用预训练生成器和判别器权重，请按版本手动放入：
+
+- `pretrain/pretrained/`
+- `pretrain/pretrained_v2/`
