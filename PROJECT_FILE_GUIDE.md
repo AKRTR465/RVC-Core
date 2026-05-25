@@ -248,9 +248,6 @@
 - `infer/lib/infer_pack/transforms.py`
   flow 相关的 spline 变换实现。
 
-- `infer/lib/infer_pack/modules/F0Predictor/`
-  `Dio`、`Harvest`、`PM` 等 F0 predictor 的封装实现。
-
 ### `infer/lib/train/`
 
 这是训练链路的公共库。
