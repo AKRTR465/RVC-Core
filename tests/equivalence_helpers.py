@@ -1,8 +1,8 @@
 import contextlib
 import os
 import sys
-import tempfile
 import types
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -93,7 +93,14 @@ def fake_librosa():
 @contextlib.contextmanager
 def make_temp_dir():
     TMP_ROOT.mkdir(parents=True, exist_ok=True)
-    yield tempfile.mkdtemp(dir=TMP_ROOT)
+    while True:
+        path = TMP_ROOT / f"tmp_{uuid.uuid4().hex}"
+        try:
+            path.mkdir()
+            break
+        except FileExistsError:
+            continue
+    yield str(path)
 
 
 def write_sine_wav(path, sr=16000, seconds=2.0, freq=220.0):

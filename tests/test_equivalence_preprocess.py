@@ -5,12 +5,14 @@ from pathlib import Path
 import numpy as np
 
 from tests.equivalence_helpers import (
+    REPO_ROOT,
     collect_binary_tree,
     fake_librosa,
     make_temp_dir,
 )
 
 
+@unittest.skipUnless((REPO_ROOT / "infer").exists(), "legacy infer tree removed")
 class PreprocessEquivalenceTest(unittest.TestCase):
     def test_audio_preprocess_outputs_match_infer(self):
         sr = 16000

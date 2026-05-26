@@ -1,4 +1,4 @@
-﻿import torch
+import torch
 
 
 def feature_loss(fmap_r, fmap_g):
@@ -54,6 +54,7 @@ def kl_loss(z_p, logs_q, m_p, logs_p, z_mask):
     kl = logs_p - logs_q - 0.5
     kl += 0.5 * ((z_p - m_p) ** 2) * torch.exp(-2.0 * logs_p)
     kl = torch.sum(kl * z_mask)
-    l = kl / torch.sum(z_mask)
+    denom = torch.clamp(torch.sum(z_mask), min=1.0)
+    l = kl / denom
     return l
 

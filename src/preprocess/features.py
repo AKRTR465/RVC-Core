@@ -1,15 +1,15 @@
 import argparse
 import os
 import sys
-import traceback
 from pathlib import Path
 
 import numpy as np
 import soundfile as sf
 import torch
-import torch.nn.functional as F
 
 from configs.project_config import load_project_config, parse_hparams_overrides
+from src.features.hubert import load_hubert_model as load_shared_hubert_model
+from src.features.hubert import read_wave_16k
 
 
 def log_message(log_path, message):
@@ -19,54 +19,18 @@ def log_message(log_path, message):
         handle.flush()
 
 
-def read_wave(wav_path, normalize=False):
-    wav, sr = sf.read(wav_path)
-    assert sr == 16000
-    feats = torch.from_numpy(wav).float()
-    if feats.dim() == 2:
-        feats = feats.mean(-1)
-    assert feats.dim() == 1, feats.dim()
-    if normalize:
-        with torch.no_grad():
-            feats = F.layer_norm(feats, feats.shape)
-    return feats.view(1, -1)
-
-
 def resolve_device(device_request, i_gpu=""):
     if i_gpu:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(i_gpu)
-    if device_request not in {"auto", "cpu", "cuda"}:
-        raise ValueError("--device must be one of: auto, cpu, cuda")
+    if device_request not in {"auto", "cpu", "cuda"} and not str(device_request).startswith("cuda:"):
+        raise ValueError("--device must be one of: auto, cpu, cuda, cuda:<index>")
     if device_request == "cpu":
         return "cpu"
-    if device_request == "cuda":
+    if device_request == "cuda" or str(device_request).startswith("cuda:"):
         if not torch.cuda.is_available():
             raise RuntimeError("Requested CUDA for feature extraction, but CUDA is not available")
-        return "cuda"
+        return device_request
     return "cuda" if torch.cuda.is_available() else "cpu"
-
-
-def load_hubert_model(model_path, device, is_half, log_path):
-    import fairseq
-
-    if not Path(model_path).is_file():
-        log_message(
-            log_path,
-            "Error: Extracting is shut down because %s does not exist, you may download it from https://huggingface.co/lj1995/VoiceConversionWebUI/tree/main"
-            % model_path,
-        )
-        return None, None
-
-    log_message(log_path, f"load model(s) from {model_path}")
-    models, saved_cfg, _ = fairseq.checkpoint_utils.load_model_ensemble_and_task(
-        [str(model_path)],
-        suffix="",
-    )
-    model = models[0].to(device)
-    log_message(log_path, f"move model to {device}")
-    if is_half and device != "cpu":
-        model = model.half()
-    return model.eval(), saved_cfg
 
 
 def output_dir_for_version(exp_dir, version):
@@ -91,30 +55,39 @@ def extract_features(
     log_path = log_path or exp_path / "extract_f0_feature.log"
 
     log_message(log_path, f"exp_dir: {exp_path}")
-    model, saved_cfg = load_hubert_model(model_path, device, is_half, log_path)
-    if model is None:
-        return
 
-    todo = sorted(os.listdir(wav_dir))[i_part::n_part]
+    todo = [
+        path
+        for path in sorted(wav_dir.iterdir())
+        if path.is_file() and path.suffix.lower() == ".wav"
+    ][i_part::n_part]
     every = max(1, len(todo) // 10)
     if not todo:
         log_message(log_path, "no-feature-todo")
         return
 
+    model, saved_cfg = load_shared_hubert_model(
+        model_path,
+        device,
+        is_half,
+        log_fn=lambda message: log_message(log_path, message),
+    )
+    if model is None:
+        return
+
     log_message(log_path, f"all-feature-{len(todo)}")
     output_layer = 9 if version == "v1" else 12
-    for idx, file in enumerate(todo):
+    failures = 0
+    for idx, wav_path in enumerate(todo):
+        file = wav_path.name
         try:
-            if not file.endswith(".wav"):
-                continue
-            wav_path = wav_dir / file
-            out_path = out_dir / file.replace("wav", "npy")
+            out_path = out_dir / wav_path.with_suffix(".npy").name
             if out_path.exists():
                 continue
 
-            feats = read_wave(wav_path, normalize=saved_cfg.task.normalize)
+            feats = read_wave_16k(wav_path, sf, normalize=saved_cfg.task.normalize)
             padding_mask = torch.BoolTensor(feats.shape).fill_(False)
-            source = feats.half() if is_half and device != "cpu" else feats
+            source = feats.half() if is_half and torch.device(device).type != "cpu" else feats
             inputs = {
                 "source": source.to(device),
                 "padding_mask": padding_mask.to(device),
@@ -125,17 +98,20 @@ def extract_features(
                 feats = model.final_proj(logits[0]) if version == "v1" else logits[0]
 
             feature_npy = feats.squeeze(0).float().cpu().numpy()
-            if np.isnan(feature_npy).sum() == 0:
+            if np.isfinite(feature_npy).all():
                 np.save(out_path, feature_npy, allow_pickle=False)
             else:
-                log_message(log_path, f"{file}-contains nan")
+                log_message(log_path, f"{file}-contains non-finite values")
             if idx % every == 0:
                 log_message(
                     log_path,
-                    f"now-{len(todo)},all-{idx},{file},{feature_npy.shape}",
+                    f"now-{idx},all-{len(todo)},{file},{feature_npy.shape}",
                 )
-        except Exception:
-            log_message(log_path, traceback.format_exc())
+        except (OSError, RuntimeError, ValueError, sf.SoundFileError) as exc:
+            failures += 1
+            log_message(log_path, f"{file}-feature-fail-{type(exc).__name__}: {exc}")
+    if failures:
+        raise RuntimeError(f"{failures} feature extraction item(s) failed")
     log_message(log_path, "all-feature-done")
 
 
@@ -150,8 +126,8 @@ def parse_args():
     parser.add_argument("--n-part", type=int, default=1)
     parser.add_argument("--i-part", type=int, default=0)
     parser.add_argument("--i-gpu", type=str, default="")
-    parser.add_argument("--is-half", action="store_true")
-    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument("--is-half", action="store_true", default=None)
+    parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--pretrain-root", type=str, default=os.getenv("pretrain_root", "pretrain"))
     parser.add_argument("--model-path", type=str, default="")
     args = parser.parse_args()
@@ -161,7 +137,15 @@ def parse_args():
             parser.error(
                 "legacy mode requires: device n_part i_part [i_gpu] exp_dir version is_half"
             )
-        if any([args.config, args.exp_dir, args.version, args.i_gpu, args.is_half]):
+        if any(
+            [
+                args.config,
+                args.exp_dir,
+                args.version,
+                args.i_gpu,
+                args.is_half is not None,
+            ]
+        ):
             parser.error("legacy mode cannot be mixed with config or named feature options")
         args.n_part = int(args.legacy_args[1])
         args.i_part = int(args.legacy_args[2])
@@ -174,11 +158,14 @@ def parse_args():
             args.exp_dir = args.legacy_args[4]
             args.version = args.legacy_args[5]
             args.is_half = args.legacy_args[6].lower() == "true"
-        args.device = "auto"
+        args.device = args.legacy_args[0]
 
     if args.config:
         if args.exp_dir or args.version or args.pretrain_root != os.getenv("pretrain_root", "pretrain"):
-            parser.error("config mode only accepts --config, --hparams, --reset, partition, device, and model options")
+            parser.error(
+                "config mode only accepts --config, --hparams, --reset, "
+                "partition, device, and model options"
+            )
         project = load_project_config(
             args.config,
             overrides=parse_hparams_overrides(args.hparams),
@@ -187,8 +174,11 @@ def parse_args():
         args.exp_dir = project["preprocess_dir"]
         args.version = project["version"]
         args.pretrain_root = project["pretrain_root"]
-        args.device = "cuda" if str(project["device"]).startswith("cuda") else "cpu"
-        args.is_half = bool(project["is_half"])
+        if args.device == "auto":
+            device = str(project["device"])
+            args.device = device if device.startswith("cuda") else "cpu"
+        if args.is_half is None:
+            args.is_half = bool(project["is_half"])
 
     if args.exp_dir == "" or args.version == "":
         parser.error("provide --config or both --exp-dir and --version")
@@ -198,6 +188,8 @@ def parse_args():
         parser.error("--i-part must satisfy 0 <= i_part < n_part")
     if args.model_path == "":
         args.model_path = str(Path(args.pretrain_root) / "hubert" / "hubert_base.pt")
+    if args.is_half is None:
+        args.is_half = False
     return args
 
 

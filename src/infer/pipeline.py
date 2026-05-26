@@ -1,46 +1,35 @@
-﻿import os
-import traceback
+import os
 import logging
 
 logger = logging.getLogger(__name__)
 
-from functools import lru_cache
 from time import time as ttime
 
-import faiss
-import librosa
 import numpy as np
-import parselmouth
-import pyworld
 import torch
 import torch.nn.functional as F
-import torchcrepe
 from scipy import signal
+
+from src.features.f0 import (
+    F0_MAX,
+    F0_MIN,
+    compute_crepe_f0,
+    compute_pm_f0,
+    compute_world_f0,
+    f0_to_coarse,
+    load_rmvpe_model,
+)
+from src.index.retrieval import blend_search_features, load_retrieval_index
 
 bh, ah = signal.butter(N=5, Wn=48, btype="high", fs=16000)
 
-input_audio_path2wav = {}
 
+def change_rms(data1, sr1, data2, sr2, rate):
+    import librosa
 
-@lru_cache
-def cache_harvest_f0(input_audio_path, fs, f0max, f0min, frame_period):
-    audio = input_audio_path2wav[input_audio_path]
-    f0, t = pyworld.harvest(
-        audio,
-        fs=fs,
-        f0_ceil=f0max,
-        f0_floor=f0min,
-        frame_period=frame_period,
-    )
-    f0 = pyworld.stonemask(audio, f0, t, fs)
-    return f0
-
-
-def change_rms(data1, sr1, data2, sr2, rate):  # 1是输入音频，2是输出音频,rate是2的占比
-    # print(data1.max(),data2.max())
     rms1 = librosa.feature.rms(
         y=data1, frame_length=sr1 // 2 * 2, hop_length=sr1 // 2
-    )  # 每半秒一个点
+    )
     rms2 = librosa.feature.rms(y=data2, frame_length=sr2 // 2 * 2, hop_length=sr2 // 2)
     rms1 = torch.from_numpy(rms1)
     rms1 = F.interpolate(
@@ -58,7 +47,7 @@ def change_rms(data1, sr1, data2, sr2, rate):  # 1是输入音频，2是输出�
     return data2
 
 
-class Pipeline(object):
+class Pipeline:
     def __init__(self, tgt_sr, config):
         self.x_pad, self.x_query, self.x_center, self.x_max, self.is_half = (
             config.x_pad,
@@ -67,14 +56,14 @@ class Pipeline(object):
             config.x_max,
             config.is_half,
         )
-        self.sr = 16000  # hubert输入采样率
-        self.window = 160  # 每帧点数
-        self.t_pad = self.sr * self.x_pad  # 每条前后pad时间
+        self.sr = 16000
+        self.window = 160
+        self.t_pad = self.sr * self.x_pad
         self.t_pad_tgt = tgt_sr * self.x_pad
         self.t_pad2 = self.t_pad * 2
-        self.t_query = self.sr * self.x_query  # 查询切点前后查询时间
-        self.t_center = self.sr * self.x_center  # 查询切点位置
-        self.t_max = self.sr * self.x_max  # 免查询时长阈值
+        self.t_query = self.sr * self.x_query
+        self.t_center = self.sr * self.x_center
+        self.t_max = self.sr * self.x_max
         self.device = config.device
         self.rmvpe_path = getattr(
             config,
@@ -86,7 +75,6 @@ class Pipeline(object):
 
     def get_f0(
         self,
-        input_audio_path,
         x,
         p_len,
         f0_up_key,
@@ -94,69 +82,29 @@ class Pipeline(object):
         filter_radius,
         inp_f0=None,
     ):
-        global input_audio_path2wav
-        time_step = self.window / self.sr * 1000
-        f0_min = 50
-        f0_max = 1100
-        f0_mel_min = 1127 * np.log(1 + f0_min / 700)
-        f0_mel_max = 1127 * np.log(1 + f0_max / 700)
         if f0_method == "pm":
-            f0 = (
-                parselmouth.Sound(x, self.sr)
-                .to_pitch_ac(
-                    time_step=time_step / 1000,
-                    voicing_threshold=0.6,
-                    pitch_floor=f0_min,
-                    pitch_ceiling=f0_max,
-                )
-                .selected_array["frequency"]
-            )
-            pad_size = (p_len - len(f0) + 1) // 2
-            if pad_size > 0 or p_len - len(f0) - pad_size > 0:
-                f0 = np.pad(
-                    f0, [[pad_size, p_len - len(f0) - pad_size]], mode="constant"
-                )
+            f0 = compute_pm_f0(x, self.sr, p_len, F0_MIN, F0_MAX, self.window)
         elif f0_method == "harvest":
-            input_audio_path2wav[input_audio_path] = x.astype(np.double)
-            f0 = cache_harvest_f0(input_audio_path, self.sr, f0_max, f0_min, 10)
+            f0 = compute_world_f0(x, self.sr, self.window, "harvest", F0_MIN, F0_MAX)
             if filter_radius > 2:
                 f0 = signal.medfilt(f0, 3)
         elif f0_method == "crepe":
-            model = "full"
-            # Pick a batch size that doesn't cause memory errors on your gpu
-            batch_size = 512
-            # Compute pitch using first gpu
-            audio = torch.tensor(np.copy(x))[None].float()
-            f0, pd = torchcrepe.predict(
-                audio,
-                self.sr,
-                self.window,
-                f0_min,
-                f0_max,
-                model,
-                batch_size=batch_size,
-                device=self.device,
-                return_periodicity=True,
-            )
-            pd = torchcrepe.filter.median(pd, 3)
-            f0 = torchcrepe.filter.mean(f0, 3)
-            f0[pd < 0.1] = 0
-            f0 = f0[0].cpu().numpy()
+            f0 = compute_crepe_f0(x, self.sr, self.window, self.device, F0_MIN, F0_MAX)
         elif f0_method == "rmvpe":
             if not hasattr(self, "model_rmvpe"):
-                from src.utils.rmvpe import RMVPE
-
-                logger.info("Loading rmvpe model,%s", self.rmvpe_path)
-                self.model_rmvpe = RMVPE(
+                self.model_rmvpe = load_rmvpe_model(
                     self.rmvpe_path,
-                    is_half=self.is_half,
-                    device=self.device,
+                    self.device,
+                    self.is_half,
+                    logger.info,
                 )
             f0 = self.model_rmvpe.infer_from_audio(x, thred=0.03)
+        else:
+            raise ValueError(f"Unsupported f0 method: {f0_method}")
 
+        f0 = f0.astype(np.float64, copy=True)
         f0 *= pow(2, f0_up_key / 12)
-        # with open("test.txt","w")as f:f.write("\n".join([str(i)for i in f0.tolist()]))
-        tf0 = self.sr // self.window  # 每秒f0点数
+        tf0 = self.sr // self.window
         if inp_f0 is not None:
             delta_t = np.round(
                 (inp_f0[:, 0].max() - inp_f0[:, 0].min()) * tf0 + 1
@@ -168,16 +116,9 @@ class Pipeline(object):
             f0[self.x_pad * tf0 : self.x_pad * tf0 + len(replace_f0)] = replace_f0[
                 :shape
             ]
-        # with open("test_opt.txt","w")as f:f.write("\n".join([str(i)for i in f0.tolist()]))
         f0bak = f0.copy()
-        f0_mel = 1127 * np.log(1 + f0 / 700)
-        f0_mel[f0_mel > 0] = (f0_mel[f0_mel > 0] - f0_mel_min) * 254 / (
-            f0_mel_max - f0_mel_min
-        ) + 1
-        f0_mel[f0_mel <= 1] = 1
-        f0_mel[f0_mel > 255] = 255
-        f0_coarse = np.rint(f0_mel).astype(np.int32)
-        return f0_coarse, f0bak  # 1-0
+        f0_coarse = f0_to_coarse(f0, F0_MIN, F0_MAX)
+        return f0_coarse, f0bak
 
     def vc(
         self,
@@ -193,7 +134,7 @@ class Pipeline(object):
         index_rate,
         version,
         protect,
-    ):  # ,file_index,file_big_npy
+    ):
         feats = torch.from_numpy(audio0)
         if self.is_half:
             feats = feats.half()
@@ -201,7 +142,10 @@ class Pipeline(object):
             feats = feats.float()
         if feats.dim() == 2:  # double channels
             feats = feats.mean(-1)
-        assert feats.dim() == 1, feats.dim()
+        if feats.dim() != 1:
+            raise ValueError(f"Expected mono audio tensor, got dim={feats.dim()}")
+        if getattr(model, "task_normalize", False):
+            feats = F.layer_norm(feats, feats.shape)
         feats = feats.view(1, -1)
         padding_mask = torch.BoolTensor(feats.shape).to(self.device).fill_(False)
 
@@ -225,13 +169,7 @@ class Pipeline(object):
             if self.is_half:
                 npy = npy.astype("float32")
 
-            # _, I = index.search(npy, 1)
-            # npy = big_npy[I.squeeze()]
-
-            score, ix = index.search(npy, k=8)
-            weight = np.square(1 / score)
-            weight /= weight.sum(axis=1, keepdims=True)
-            npy = np.sum(big_npy[ix] * np.expand_dims(weight, axis=2), axis=1)
+            npy = blend_search_features(index, big_npy, npy)
 
             if self.is_half:
                 npy = npy.astype("float16")
@@ -264,7 +202,7 @@ class Pipeline(object):
         with torch.no_grad():
             hasp = pitch is not None and pitchf is not None
             arg = (feats, p_len, pitch, pitchf, sid) if hasp else (feats, p_len, sid)
-            audio1 = (net_g.infer(*arg)[0][0, 0]).data.cpu().float().numpy()
+            audio1 = (net_g.infer(*arg)[0][0, 0]).detach().cpu().float().numpy()
             del hasp, arg
         del feats, p_len, padding_mask
         if torch.cuda.is_available():
@@ -280,7 +218,6 @@ class Pipeline(object):
         net_g,
         sid,
         audio,
-        input_audio_path,
         times,
         f0_up_key,
         f0_method,
@@ -297,20 +234,25 @@ class Pipeline(object):
     ):
         if (
             file_index != ""
-            # and file_big_npy != ""
-            # and os.path.exists(file_big_npy) == True
             and os.path.exists(file_index)
             and index_rate != 0
         ):
             try:
-                index = faiss.read_index(file_index)
-                # big_npy = np.load(file_big_npy)
-                big_npy = index.reconstruct_n(0, index.ntotal)
-            except:
-                traceback.print_exc()
+                index, big_npy = load_retrieval_index(file_index)
+            except (OSError, RuntimeError, ValueError) as exc:
+                logger.warning("Failed to load retrieval index %s: %s", file_index, exc)
                 index = big_npy = None
         else:
             index = big_npy = None
+        min_audio_len = max(
+            max(len(ah), len(bh)) * 3,
+            self.window // 2,
+            int(self.t_pad),
+        )
+        if audio.size <= min_audio_len:
+            raise ValueError(
+                f"Input audio is too short for filtering: {audio.size} samples"
+            )
         audio = signal.filtfilt(bh, ah, audio)
         audio_pad = np.pad(audio, (self.window // 2, self.window // 2), mode="reflect")
         opt_ts = []
@@ -342,13 +284,17 @@ class Pipeline(object):
                 for line in lines:
                     inp_f0.append([float(i) for i in line.split(",")])
                 inp_f0 = np.array(inp_f0, dtype="float32")
-            except:
-                traceback.print_exc()
+                if inp_f0.ndim != 2 or inp_f0.shape[1] < 2 or inp_f0.shape[0] == 0:
+                    raise ValueError("f0 file must contain non-empty time,f0 rows")
+                order = np.argsort(inp_f0[:, 0])
+                inp_f0 = inp_f0[order]
+            except (OSError, ValueError) as exc:
+                logger.warning("Ignoring invalid f0 file %s: %s", f0_file.name, exc)
+                inp_f0 = None
         sid = torch.tensor(sid, device=self.device).unsqueeze(0).long()
         pitch, pitchf = None, None
         if if_f0 == 1:
             pitch, pitchf = self.get_f0(
-                input_audio_path,
                 audio_pad,
                 p_len,
                 f0_up_key,
@@ -438,6 +384,8 @@ class Pipeline(object):
         if rms_mix_rate != 1:
             audio_opt = change_rms(audio, 16000, audio_opt, tgt_sr, rms_mix_rate)
         if tgt_sr != resample_sr >= 16000:
+            import librosa
+
             audio_opt = librosa.resample(
                 audio_opt, orig_sr=tgt_sr, target_sr=resample_sr
             )

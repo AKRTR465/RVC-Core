@@ -1,11 +1,6 @@
-﻿import torch
-import torch.utils.data
-from librosa.filters import mel as librosa_mel_fn
-import logging
+import torch
 
-logger = logging.getLogger(__name__)
-
-MAX_WAV_VALUE = 32768.0
+from src.features.mel import build_mel_basis
 
 
 def dynamic_range_compression_torch(x, C=1, clip_val=1e-5):
@@ -45,7 +40,7 @@ def spectrogram_torch(y, n_fft, sampling_rate, hop_size, win_size, center=False)
     Args:
         y             :: (B, T) - Audio waveforms
         n_fft
-        sampling_rate
+        sampling_rate :: kept for API compatibility; linear STFT does not use it
         hop_size
         win_size
         center
@@ -63,9 +58,14 @@ def spectrogram_torch(y, n_fft, sampling_rate, hop_size, win_size, center=False)
         )
 
     # Padding
+    pad = int((n_fft - hop_size) / 2)
+    if y.size(-1) <= pad:
+        raise ValueError(
+            f"Audio is too short for reflect padding: length={y.size(-1)}, pad={pad}"
+        )
     y = torch.nn.functional.pad(
         y.unsqueeze(1),
-        (int((n_fft - hop_size) / 2), int((n_fft - hop_size) / 2)),
+        (pad, pad),
         mode="reflect",
     )
     y = y.squeeze(1)
@@ -93,17 +93,17 @@ def spec_to_mel_torch(spec, n_fft, num_mels, sampling_rate, fmin, fmax):
     # MelBasis - Cache if needed
     global mel_basis
     dtype_device = str(spec.dtype) + "_" + str(spec.device)
-    fmax_dtype_device = str(fmax) + "_" + dtype_device
-    if fmax_dtype_device not in mel_basis:
-        mel = librosa_mel_fn(
-            sr=sampling_rate, n_fft=n_fft, n_mels=num_mels, fmin=fmin, fmax=fmax
-        )
-        mel_basis[fmax_dtype_device] = torch.from_numpy(mel).to(
+    mel_key = (
+        f"{n_fft}_{num_mels}_{sampling_rate}_{fmin}_{fmax}_{dtype_device}"
+    )
+    if mel_key not in mel_basis:
+        mel = build_mel_basis(sampling_rate, n_fft, num_mels, fmin, fmax)
+        mel_basis[mel_key] = torch.from_numpy(mel).to(
             dtype=spec.dtype, device=spec.device
         )
 
     # Mel-frequency Log-amplitude spectrogram :: (B, Freq=num_mels, Frame)
-    melspec = torch.matmul(mel_basis[fmax_dtype_device], spec)
+    melspec = torch.matmul(mel_basis[mel_key], spec)
     melspec = spectral_normalize_torch(melspec)
     return melspec
 

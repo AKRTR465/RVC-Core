@@ -4,9 +4,10 @@ from pathlib import Path
 
 import numpy as np
 
-from tests.equivalence_helpers import make_temp_dir
+from tests.equivalence_helpers import REPO_ROOT, make_temp_dir
 
 
+@unittest.skipUnless((REPO_ROOT / "infer").exists(), "legacy infer tree removed")
 class F0EquivalenceTest(unittest.TestCase):
     def test_coarse_f0_matches_infer(self):
         old_f0 = importlib.import_module("infer.modules.train.extract_f0_print")

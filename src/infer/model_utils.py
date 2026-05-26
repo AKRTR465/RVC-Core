@@ -1,7 +1,7 @@
-﻿import os
+import os
 from pathlib import Path
 
-from fairseq import checkpoint_utils
+from src.features.hubert import load_hubert_model
 
 
 def _iter_paths(root, suffix):
@@ -13,12 +13,24 @@ def _iter_paths(root, suffix):
 
 def get_model_path_from_sid(sid, ckpt_root):
     sid_path = Path(sid)
-    if sid_path.is_absolute() and sid_path.exists():
-        return str(sid_path)
-
     root_path = Path(ckpt_root)
+    root_resolved = root_path.resolve()
+    if sid_path.is_absolute():
+        absolute_path = sid_path.resolve()
+        try:
+            absolute_path.relative_to(root_resolved)
+        except ValueError:
+            return ""
+        if absolute_path.is_file() and absolute_path.suffix == ".pth":
+            return str(absolute_path)
+        return ""
+
     direct_path = (root_path / sid_path).resolve()
-    if direct_path.exists():
+    try:
+        direct_path.relative_to(root_resolved)
+    except ValueError:
+        return ""
+    if direct_path.is_file() and direct_path.suffix == ".pth":
         return str(direct_path)
 
     matches = []
@@ -59,15 +71,8 @@ def load_hubert(config):
         "hubert_path",
         os.path.join(getattr(config, "pretrain_root", "pretrain"), "hubert", "hubert_base.pt"),
     )
-    models, _, _ = checkpoint_utils.load_model_ensemble_and_task(
-        [model_path],
-        suffix="",
-    )
-    hubert_model = models[0]
-    hubert_model = hubert_model.to(config.device)
-    if config.is_half:
-        hubert_model = hubert_model.half()
-    else:
-        hubert_model = hubert_model.float()
-    return hubert_model.eval()
+    hubert_model, _ = load_hubert_model(model_path, config.device, config.is_half)
+    if hubert_model is None:
+        raise FileNotFoundError(model_path)
+    return hubert_model
 

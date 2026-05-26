@@ -1,5 +1,5 @@
-from src.preprocess.audio import preprocess_trainset, parse_args
+from src.preprocess.pipeline import main
 
 
 if __name__ == "__main__":
-    preprocess_trainset(*parse_args())
+    main()

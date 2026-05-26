@@ -13,6 +13,10 @@ selectors:
   sample_rate: 48k
   if_f0: 1
 
+train:
+  pretrainG: pretrain/pretrained/f0G48k.pth
+  pretrainD: pretrain/pretrained/f0D48k.pth
+
 model:
   spk_embed_dim: 109
 

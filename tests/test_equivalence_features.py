@@ -14,6 +14,7 @@ from tests.equivalence_helpers import (
 )
 
 
+@unittest.skipUnless((REPO_ROOT / "infer").exists(), "legacy infer tree removed")
 class FeatureEquivalenceTest(unittest.TestCase):
     def test_feature_worker_outputs_match_infer_with_fake_hubert(self):
         with make_temp_dir() as tmp:

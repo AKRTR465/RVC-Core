@@ -1,11 +1,9 @@
-﻿import argparse
+import argparse
 import copy
 import glob
 import logging
 import os
 import subprocess
-import sys
-import shutil
 from pathlib import Path
 
 import numpy as np
@@ -20,12 +18,12 @@ from configs.project_config import (
 
 MATPLOTLIB_FLAG = False
 
-logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
-logger = logging
+logger = logging.getLogger(__name__)
 
 
 def load_checkpoint_d(checkpoint_path, combd, sbd, optimizer=None, load_opt=1):
-    assert os.path.isfile(checkpoint_path)
+    if not os.path.isfile(checkpoint_path):
+        raise FileNotFoundError(checkpoint_path)
     checkpoint_dict = torch.load(checkpoint_path, map_location="cpu")
 
     ##################
@@ -47,8 +45,7 @@ def load_checkpoint_d(checkpoint_path, combd, sbd, optimizer=None, load_opt=1):
                         saved_state_dict[k].shape,
                     )  #
                     raise KeyError
-            except:
-                # logger.info(traceback.format_exc())
+            except KeyError:
                 logger.info("%s is not in the checkpoint", k)  # pretrain缺失的
                 new_state_dict[k] = v  # 模型自带的随机值
         if hasattr(model, "module"):
@@ -67,45 +64,13 @@ def load_checkpoint_d(checkpoint_path, combd, sbd, optimizer=None, load_opt=1):
     if (
         optimizer is not None and load_opt == 1
     ):  ###加载不了，如果是空的的话，重新初始化，可能还会影响lr时间表的更新，因此在train文件最外围catch
-        #   try:
         optimizer.load_state_dict(checkpoint_dict["optimizer"])
-    #   except:
-    #     traceback.print_exc()
     logger.info("Loaded checkpoint '{}' (epoch {})".format(checkpoint_path, iteration))
     return model, optimizer, learning_rate, iteration
 
-
-# def load_checkpoint(checkpoint_path, model, optimizer=None):
-#   assert os.path.isfile(checkpoint_path)
-#   checkpoint_dict = torch.load(checkpoint_path, map_location='cpu')
-#   iteration = checkpoint_dict['iteration']
-#   learning_rate = checkpoint_dict['learning_rate']
-#   if optimizer is not None:
-#     optimizer.load_state_dict(checkpoint_dict['optimizer'])
-#   # print(1111)
-#   saved_state_dict = checkpoint_dict['model']
-#   # print(1111)
-#
-#   if hasattr(model, 'module'):
-#     state_dict = model.module.state_dict()
-#   else:
-#     state_dict = model.state_dict()
-#   new_state_dict= {}
-#   for k, v in state_dict.items():
-#     try:
-#       new_state_dict[k] = saved_state_dict[k]
-#     except:
-#       logger.info("%s is not in the checkpoint" % k)
-#       new_state_dict[k] = v
-#   if hasattr(model, 'module'):
-#     model.module.load_state_dict(new_state_dict)
-#   else:
-#     model.load_state_dict(new_state_dict)
-#   logger.info("Loaded checkpoint '{}' (epoch {})" .format(
-#     checkpoint_path, iteration))
-#   return model, optimizer, learning_rate, iteration
 def load_checkpoint(checkpoint_path, model, optimizer=None, load_opt=1):
-    assert os.path.isfile(checkpoint_path)
+    if not os.path.isfile(checkpoint_path):
+        raise FileNotFoundError(checkpoint_path)
     checkpoint_dict = torch.load(checkpoint_path, map_location="cpu")
 
     saved_state_dict = checkpoint_dict["model"]
@@ -125,8 +90,7 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, load_opt=1):
                     saved_state_dict[k].shape,
                 )  #
                 raise KeyError
-        except:
-            # logger.info(traceback.format_exc())
+        except KeyError:
             logger.info("%s is not in the checkpoint", k)  # pretrain缺失的
             new_state_dict[k] = v  # 模型自带的随机值
     if hasattr(model, "module"):
@@ -140,10 +104,7 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, load_opt=1):
     if (
         optimizer is not None and load_opt == 1
     ):  ###加载不了，如果是空的的话，重新初始化，可能还会影响lr时间表的更新，因此在train文件最外围catch
-        #   try:
         optimizer.load_state_dict(checkpoint_dict["optimizer"])
-    #   except:
-    #     traceback.print_exc()
     logger.info("Loaded checkpoint '{}' (epoch {})".format(checkpoint_path, iteration))
     return model, optimizer, learning_rate, iteration
 
@@ -198,12 +159,16 @@ def save_checkpoint_d(combd, sbd, optimizer, learning_rate, iteration, checkpoin
 def summarize(
     writer,
     global_step,
-    scalars={},
-    histograms={},
-    images={},
-    audios={},
+    scalars=None,
+    histograms=None,
+    images=None,
+    audios=None,
     audio_sampling_rate=22050,
 ):
+    scalars = scalars or {}
+    histograms = histograms or {}
+    images = images or {}
+    audios = audios or {}
     for k, v in scalars.items():
         writer.add_scalar(k, v, global_step)
     for k, v in histograms.items():
@@ -216,16 +181,16 @@ def summarize(
 
 def latest_checkpoint_path(dir_path, regex="G_*.pth"):
     f_list = glob.glob(os.path.join(dir_path, regex))
-    f_list.sort(key=lambda f: int("".join(filter(str.isdigit, f))))
-    x = f_list[-1]
-    logger.debug(x)
-    return x
+    if not f_list:
+        raise FileNotFoundError(f"No checkpoint matching {regex} under {dir_path}")
+    f_list.sort(key=lambda f: int("".join(filter(str.isdigit, Path(f).stem)) or -1))
+    return f_list[-1]
 
 
 def _figure_canvas_to_rgb_array(fig, np):
     fig.canvas.draw()
     if hasattr(fig.canvas, "tostring_rgb"):
-        data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep="")
+        data = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
         return data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
     return np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()
 
@@ -289,12 +254,8 @@ def load_wav_to_torch(full_path):
 
 
 def load_filepaths_and_text(filename, split="|"):
-    try:
-        with open(filename, encoding="utf-8") as f:
-            filepaths_and_text = [line.strip().split(split) for line in f]
-    except UnicodeDecodeError:
-        with open(filename) as f:
-            filepaths_and_text = [line.strip().split(split) for line in f]
+    with open(filename, encoding="utf-8-sig") as f:
+        filepaths_and_text = [line.strip().split(split) for line in f if line.strip()]
     
     return filepaths_and_text
 
@@ -399,7 +360,8 @@ def _apply_training_cli_overrides(config, args):
         replayable_train["save_every_weights"] = train["save_every_weights"]
         replayable_train["batch_size"] = train["batch_size"]
 
-    config["gpus"] = args.gpus
+    if args.gpus is not None:
+        config["gpus"] = args.gpus
     _sync_train_aliases(config)
     return config
 
@@ -451,7 +413,7 @@ def get_hparams(init=True):
     parser.add_argument(
         "-pd", "--pretrainD", type=str, default="", help="Pretrained Discriminator path"
     )
-    parser.add_argument("-g", "--gpus", type=str, default="0", help="split by -")
+    parser.add_argument("-g", "--gpus", type=str, default=None, help="split by -")
     parser.add_argument(
         "-bs", "--batch_size", type=int, default=None, help="batch size"
     )
@@ -511,17 +473,19 @@ def get_hparams_from_dir(model_dir):
     model_dir_path = Path(model_dir)
     config_save_path = model_dir_path.parent / "config.yaml"
     config = load_project_config(config_save_path, reset=True)
+    _sync_train_aliases(config)
     return _build_hparams(config)
 
 
 def get_hparams_from_file(config_path):
     path = Path(config_path)
     config = load_project_config(path, reset=path.name == "config.yaml")
+    _sync_train_aliases(config)
     return _build_hparams(config)
 
 
 def check_git_hash(model_dir):
-    source_dir = os.path.dirname(os.path.realpath(__file__))
+    source_dir = Path(__file__).resolve().parents[2]
     if not os.path.exists(os.path.join(source_dir, ".git")):
         logger.warning(
             "{} is not a git repository, therefore hash value comparison will be ignored.".format(
@@ -534,7 +498,7 @@ def check_git_hash(model_dir):
 
     path = os.path.join(model_dir, "githash")
     if os.path.exists(path):
-        saved_hash = open(path).read()
+        saved_hash = open(path, encoding="utf-8").read()
         if saved_hash != cur_hash:
             logger.warning(
                 "git hash values are different. {}(saved) != {}(current)".format(
@@ -542,7 +506,7 @@ def check_git_hash(model_dir):
                 )
             )
     else:
-        open(path, "w").write(cur_hash)
+        open(path, "w", encoding="utf-8").write(cur_hash)
 
 
 def get_logger(model_dir, filename="train.log"):
@@ -556,7 +520,15 @@ def get_logger(model_dir, filename="train.log"):
     h = logging.FileHandler(os.path.join(model_dir, filename))
     h.setLevel(logging.DEBUG)
     h.setFormatter(formatter)
-    logger.addHandler(h)
+    target = os.path.abspath(os.path.join(model_dir, filename))
+    if not any(
+        isinstance(handler, logging.FileHandler)
+        and os.path.abspath(handler.baseFilename) == target
+        for handler in logger.handlers
+    ):
+        logger.addHandler(h)
+    else:
+        h.close()
     return logger
 
 

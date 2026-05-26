@@ -2,9 +2,10 @@ import importlib
 import unittest
 from pathlib import Path
 
-from tests.equivalence_helpers import fake_fairseq, make_temp_dir
+from tests.equivalence_helpers import REPO_ROOT, fake_fairseq, make_temp_dir
 
 
+@unittest.skipUnless((REPO_ROOT / "infer").exists(), "legacy infer tree removed")
 class InferRuntimeEquivalenceTest(unittest.TestCase):
     def test_model_and_index_path_helpers_match_infer(self):
         with fake_fairseq():

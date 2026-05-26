@@ -1,1 +1,1 @@
-"""RVC neural network building blocks shared by training and inference."""
+"""Compatibility package for legacy model imports."""

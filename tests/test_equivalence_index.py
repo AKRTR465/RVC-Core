@@ -8,6 +8,7 @@ import numpy as np
 from tests.equivalence_helpers import REPO_ROOT, make_temp_dir, patched_argv
 
 
+@unittest.skipUnless((REPO_ROOT / "infer").exists(), "legacy infer tree removed")
 class IndexEquivalenceTest(unittest.TestCase):
     def test_v1_index_outputs_match_infer(self):
         faiss = importlib.import_module("faiss")

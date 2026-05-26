@@ -1,11 +1,22 @@
-﻿import argparse
+import argparse
 import logging
 import os
 import sys
-import traceback
 from multiprocessing import Process, cpu_count
+from pathlib import Path
 
 import numpy as np
+
+from configs.project_config import load_project_config, parse_hparams_overrides
+from src.features.f0 import (
+    F0_BIN,
+    F0_MAX,
+    F0_MIN,
+    compute_pm_f0,
+    compute_world_f0,
+    f0_to_coarse,
+    load_rmvpe_model,
+)
 
 logging.getLogger("numba").setLevel(logging.WARNING)
 
@@ -52,7 +63,7 @@ def detect_cuda_profile():
     }
 
 
-class FeatureInput(object):
+class FeatureInput:
     def __init__(
         self,
         samplerate=16000,
@@ -67,11 +78,9 @@ class FeatureInput(object):
         self.is_half = is_half
         self.pretrain_root = pretrain_root
 
-        self.f0_bin = 256
-        self.f0_max = 1100.0
-        self.f0_min = 50.0
-        self.f0_mel_min = 1127 * np.log(1 + self.f0_min / 700)
-        self.f0_mel_max = 1127 * np.log(1 + self.f0_max / 700)
+        self.f0_bin = F0_BIN
+        self.f0_max = F0_MAX
+        self.f0_min = F0_MIN
 
     def compute_f0(self, path, f0_method):
         from src.utils.audio import load_audio
@@ -79,55 +88,16 @@ class FeatureInput(object):
         x = load_audio(path, self.fs)
         p_len = x.shape[0] // self.hop
         if f0_method == "pm":
-            import parselmouth
-
-            time_step = 160 / 16000 * 1000
-            f0 = (
-                parselmouth.Sound(x, self.fs)
-                .to_pitch_ac(
-                    time_step=time_step / 1000,
-                    voicing_threshold=0.6,
-                    pitch_floor=self.f0_min,
-                    pitch_ceiling=self.f0_max,
-                )
-                .selected_array["frequency"]
-            )
-            pad_size = (p_len - len(f0) + 1) // 2
-            if pad_size > 0 or p_len - len(f0) - pad_size > 0:
-                f0 = np.pad(
-                    f0, [[pad_size, p_len - len(f0) - pad_size]], mode="constant"
-                )
-        elif f0_method == "harvest":
-            import pyworld
-
-            f0, t = pyworld.harvest(
-                x.astype(np.double),
-                fs=self.fs,
-                f0_ceil=self.f0_max,
-                f0_floor=self.f0_min,
-                frame_period=1000 * self.hop / self.fs,
-            )
-            f0 = pyworld.stonemask(x.astype(np.double), f0, t, self.fs)
-        elif f0_method == "dio":
-            import pyworld
-
-            f0, t = pyworld.dio(
-                x.astype(np.double),
-                fs=self.fs,
-                f0_ceil=self.f0_max,
-                f0_floor=self.f0_min,
-                frame_period=1000 * self.hop / self.fs,
-            )
-            f0 = pyworld.stonemask(x.astype(np.double), f0, t, self.fs)
+            f0 = compute_pm_f0(x, self.fs, p_len, self.f0_min, self.f0_max, self.hop)
+        elif f0_method in {"harvest", "dio"}:
+            f0 = compute_world_f0(x, self.fs, self.hop, f0_method, self.f0_min, self.f0_max)
         elif f0_method == "rmvpe":
             if hasattr(self, "model_rmvpe") is False:
-                from src.utils.rmvpe import RMVPE
-
-                print("Loading rmvpe model")
-                self.model_rmvpe = RMVPE(
+                self.model_rmvpe = load_rmvpe_model(
                     os.path.join(self.pretrain_root, "rmvpe", "rmvpe.pt"),
-                    is_half=self.is_half,
-                    device=self.device,
+                    self.device,
+                    self.is_half,
+                    print,
                 )
             f0 = self.model_rmvpe.infer_from_audio(x, thred=0.03)
         else:
@@ -135,19 +105,7 @@ class FeatureInput(object):
         return f0
 
     def coarse_f0(self, f0):
-        f0_mel = 1127 * np.log(1 + f0 / 700)
-        f0_mel[f0_mel > 0] = (f0_mel[f0_mel > 0] - self.f0_mel_min) * (
-            self.f0_bin - 2
-        ) / (self.f0_mel_max - self.f0_mel_min) + 1
-
-        f0_mel[f0_mel <= 1] = 1
-        f0_mel[f0_mel > self.f0_bin - 1] = self.f0_bin - 1
-        f0_coarse = np.rint(f0_mel).astype(int)
-        assert f0_coarse.max() <= 255 and f0_coarse.min() >= 1, (
-            f0_coarse.max(),
-            f0_coarse.min(),
-        )
-        return f0_coarse
+        return f0_to_coarse(f0, self.f0_min, self.f0_max, self.f0_bin)
 
     def go(self, paths, f0_method, log_path):
         if len(paths) == 0:
@@ -156,6 +114,7 @@ class FeatureInput(object):
 
         log_message(log_path, f"todo-f0-{len(paths)}")
         every = max(len(paths) // 5, 1)
+        failures = 0
         for idx, (inp_path, opt_path1, opt_path2) in enumerate(paths):
             try:
                 if idx % every == 0:
@@ -170,10 +129,14 @@ class FeatureInput(object):
                 np.save(opt_path2, featur_pit, allow_pickle=False)
                 coarse_pit = self.coarse_f0(featur_pit)
                 np.save(opt_path1, coarse_pit, allow_pickle=False)
-            except Exception:
+            except (OSError, RuntimeError, ValueError, ImportError) as exc:
+                failures += 1
                 log_message(
-                    log_path, f"f0fail-{idx}-{inp_path}-{traceback.format_exc()}"
+                    log_path,
+                    f"f0fail-{idx}-{inp_path}-{type(exc).__name__}: {exc}",
                 )
+        if failures:
+            raise RuntimeError(f"{failures} f0 item(s) failed")
 
 
 def parse_args():
@@ -181,6 +144,9 @@ def parse_args():
     parser.add_argument("legacy_exp_dir", nargs="?")
     parser.add_argument("legacy_workers", nargs="?")
     parser.add_argument("legacy_f0method", nargs="?")
+    parser.add_argument("--config", type=str, default="")
+    parser.add_argument("--hparams", type=str, default="")
+    parser.add_argument("--reset", action="store_true")
     parser.add_argument("--exp-dir", type=str, default="")
     parser.add_argument(
         "--f0method",
@@ -192,7 +158,7 @@ def parse_args():
     parser.add_argument("--n-part", type=int, default=None)
     parser.add_argument("--i-part", type=int, default=None)
     parser.add_argument("--i-gpu", type=str, default="")
-    parser.add_argument("--is-half", action="store_true")
+    parser.add_argument("--is-half", action="store_true", default=None)
     args = parser.parse_args()
 
     legacy_values = [
@@ -201,7 +167,15 @@ def parse_args():
         args.legacy_f0method,
     ]
     if any(value is not None for value in legacy_values):
-        if any([args.exp_dir, args.f0method, args.workers is not None]):
+        if any(
+            [
+                args.config,
+                args.exp_dir,
+                args.f0method,
+                args.workers is not None,
+                args.is_half is not None,
+            ]
+        ):
             parser.error("legacy mode cannot be mixed with --exp-dir/--f0method/--workers")
         if None in legacy_values:
             parser.error("legacy mode requires: exp_dir workers f0method")
@@ -209,15 +183,39 @@ def parse_args():
         args.workers = int(args.legacy_workers)
         args.f0method = args.legacy_f0method
 
+    if args.config:
+        if any(value is not None for value in legacy_values) or args.exp_dir:
+            parser.error("config mode cannot be mixed with legacy args or --exp-dir")
+        project = load_project_config(
+            args.config,
+            overrides=parse_hparams_overrides(args.hparams),
+            reset=args.reset,
+        )
+        args.exp_dir = project["preprocess_dir"]
+        args.f0method = (
+            args.f0method
+            or project.get("preprocess", {}).get("f0method")
+            or "rmvpe"
+        )
+        device = str(project["device"])
+        if device.startswith("cuda:") and args.i_gpu == "":
+            args.i_gpu = device.split(":", 1)[1]
+        if args.is_half is None:
+            args.is_half = bool(project["is_half"])
+        if args.workers is None:
+            args.workers = 1 if args.f0method == "rmvpe" else int(project["n_cpu"])
+
     if args.exp_dir == "" or args.f0method == "":
         parser.error("provide legacy args or --exp-dir and --f0method")
     if args.f0method not in {"pm", "harvest", "dio", "rmvpe"}:
         parser.error("--f0method must be one of: pm, harvest, dio, rmvpe")
 
     if args.workers is None:
-        args.workers = cpu_count()
+        args.workers = 1 if args.f0method == "rmvpe" else cpu_count()
     if args.workers < 1:
         parser.error("--workers must be >= 1")
+    if args.is_half is None:
+        args.is_half = False
 
     if (args.n_part is None) != (args.i_part is None):
         parser.error("--n-part and --i-part must be provided together")
@@ -231,21 +229,22 @@ def parse_args():
 
 
 def build_paths(exp_dir):
-    inp_root = os.path.join(exp_dir, "1_16k_wavs")
-    opt_root1 = os.path.join(exp_dir, "2a_f0")
-    opt_root2 = os.path.join(exp_dir, "2b-f0nsf")
+    inp_root = Path(exp_dir) / "1_16k_wavs"
+    opt_root1 = Path(exp_dir) / "2a_f0"
+    opt_root2 = Path(exp_dir) / "2b-f0nsf"
 
     os.makedirs(opt_root1, exist_ok=True)
     os.makedirs(opt_root2, exist_ok=True)
 
     paths = []
-    for name in sorted(list(os.listdir(inp_root))):
-        inp_path = os.path.join(inp_root, name)
-        if "spec" in inp_path:
+    for inp_path in sorted(inp_root.iterdir()):
+        if not inp_path.is_file() or inp_path.suffix.lower() != ".wav":
             continue
-        opt_path1 = os.path.join(opt_root1, name)
-        opt_path2 = os.path.join(opt_root2, name)
-        paths.append([inp_path, opt_path1, opt_path2])
+        if "spec" in inp_path.stem:
+            continue
+        opt_path1 = opt_root1 / inp_path.name
+        opt_path2 = opt_root2 / inp_path.name
+        paths.append([str(inp_path), str(opt_path1), str(opt_path2)])
     return paths
 
 
@@ -265,7 +264,7 @@ def resolve_runtime(args, log_path):
                     log_path,
                     f"rmvpe-half-request-ignored-unsupported-gpu={profile['gpu_name']}",
                 )
-            is_half = supports_half if not args.is_half else supports_half
+            is_half = bool(args.is_half and supports_half)
             return device, is_half, pretrain_root
 
         if args.is_half:
@@ -305,17 +304,14 @@ def main():
             log_path,
             f"mode=sharded,part={args.i_part}/{args.n_part},device={device},is_half={is_half}",
         )
-        try:
-            run_worker(
-                paths[args.i_part :: args.n_part],
-                args.f0method,
-                device,
-                is_half,
-                pretrain_root,
-                log_path,
-            )
-        except Exception:
-            log_message(log_path, f"f0_all_fail-{traceback.format_exc()}")
+        run_worker(
+            paths[args.i_part :: args.n_part],
+            args.f0method,
+            device,
+            is_half,
+            pretrain_root,
+            log_path,
+        )
         return
 
     log_message(
@@ -343,6 +339,10 @@ def main():
         process.start()
     for process in ps:
         process.join()
+        if process.exitcode != 0:
+            raise RuntimeError(
+                f"f0 worker {process.pid} exited with code {process.exitcode}"
+            )
 
 
 if __name__ == "__main__":

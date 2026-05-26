@@ -19,7 +19,6 @@ CONFIG_ROOT = REPO_ROOT / "configs"
 SNAPSHOT_NAME = "config.yaml"
 
 DEFAULT_PREPROCESS = {
-    "per": 3.7,
     "noparallel": False,
 }
 
@@ -38,7 +37,7 @@ DEFAULT_RUNTIME = {
 DEFAULT_INFER = {
     "model_path": "auto",
     "index_path": "auto",
-    "f0method": "fcpe",
+    "f0method": "rmvpe",
     "pitch": 12.0,
     "index_rate": 0.0,
     "block_time": 0.15,
@@ -120,7 +119,6 @@ SNAPSHOT_EXCLUDE_TOP_LEVEL = {
     "final_index_path",
     "preprocess_log_path",
     "feature_log_path",
-    "preprocess_per",
     "noparallel",
     "resolved_variant",
     "source_config_path",
@@ -135,7 +133,6 @@ REMOVED_TOP_LEVEL_FIELD_HINTS = {
     "version": "Use selectors.version instead.",
     "sample_rate": "Use selectors.sample_rate instead.",
     "if_f0": "Use selectors.if_f0 instead.",
-    "preprocess_per": "Use preprocess.per instead.",
     "noparallel": "Use preprocess.noparallel instead.",
     "device": "Use runtime.device instead.",
     "is_half": "Use runtime.is_half instead.",
@@ -408,8 +405,6 @@ def _normalize_overrides(overrides: dict[str, Any] | None) -> dict[str, Any]:
     if not overrides:
         return normalized
 
-    _validate_config_mapping(overrides, "--hparams")
-
     for key, value in overrides.items():
         if value is None:
             continue
@@ -430,6 +425,7 @@ def _normalize_overrides(overrides: dict[str, Any] | None) -> dict[str, Any]:
             cursor[parts[-1]] = value
             continue
         normalized[key] = copy.deepcopy(value)
+    _validate_config_mapping(normalized, "--hparams")
     return normalized
 
 
@@ -522,7 +518,12 @@ def _build_selectors(raw: dict[str, Any]) -> dict[str, Any]:
 
 
 def _build_preprocess(raw: dict[str, Any]) -> dict[str, Any]:
-    return _deep_merge(DEFAULT_PREPROCESS, copy.deepcopy(raw.get("preprocess") or {}))
+    preprocess = _deep_merge(
+        DEFAULT_PREPROCESS,
+        copy.deepcopy(raw.get("preprocess") or {}),
+    )
+    allowed_keys = set(DEFAULT_PREPROCESS) | {"f0method"}
+    return {key: value for key, value in preprocess.items() if key in allowed_keys}
 
 
 
@@ -694,9 +695,9 @@ def _resolve_paths(path_config: dict[str, Any], name: str) -> dict[str, str]:
     preprocess_dir = _resolve_dir(
         path_config.get("preprocess_dir"), data_root / name / "preprocess_data"
     )
-    train_dir = (work_dir / "train").resolve()
-    export_dir = (work_dir / "export").resolve()
-    index_dir = (work_dir / "index").resolve()
+    train_dir = _resolve_dir(path_config.get("train_dir"), work_dir / "train")
+    export_dir = _resolve_dir(path_config.get("export_dir"), work_dir / "export")
+    index_dir = _resolve_dir(path_config.get("index_dir"), work_dir / "index")
 
     final_model_name = str(path_config.get("final_model_name") or f"{name}.pth")
     final_index_name = str(path_config.get("final_index_name") or f"{name}.index")
@@ -747,22 +748,6 @@ def _flatten_aliases(config: dict[str, Any]) -> dict[str, Any]:
     for key, value in paths.items():
         config[key] = value
 
-    config["data_root"] = paths["data_root"]
-    config["ckpt_root"] = paths["ckpt_root"]
-    config["pretrain_root"] = paths["pretrain_root"]
-    config["work_dir"] = paths["work_dir"]
-    config["ckpt_dir"] = paths["ckpt_dir"]
-    config["dataset_dir"] = paths["dataset_dir"]
-    config["preprocess_dir"] = paths["preprocess_dir"]
-    config["train_dir"] = paths["train_dir"]
-    config["export_dir"] = paths["export_dir"]
-    config["index_dir"] = paths["index_dir"]
-    config["training_files"] = paths["training_files"]
-    config["hubert_path"] = paths["hubert_path"]
-    config["rmvpe_path"] = paths["rmvpe_path"]
-    config["final_model_path"] = paths["final_model_path"]
-    config["final_index_path"] = paths["final_index_path"]
-
     config["device"] = runtime["device"]
     config["is_half"] = runtime["is_half"]
     config["n_cpu"] = runtime["n_cpu"]
@@ -776,7 +761,6 @@ def _flatten_aliases(config: dict[str, Any]) -> dict[str, Any]:
     config["feature_dim"] = 256 if selectors["version"] == "v1" else 768
     config["model_dir"] = paths["train_dir"]
     config["experiment_dir"] = paths["work_dir"]
-    config["preprocess_per"] = config["preprocess"]["per"]
     config["noparallel"] = config["preprocess"]["noparallel"]
     return config
 
