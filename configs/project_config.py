@@ -50,10 +50,14 @@ DEFAULT_INFER = {
 
 DEFAULT_TRAIN = {
     "fp16_run": "auto",
+    "use_tqdm": "auto",
     "save_every_epoch": 10,
     "save_every_weights": False,
     "if_latest": 0,
     "if_cache_data_in_gpu": 0,
+    "num_workers": "auto",
+    "persistent_workers": "auto",
+    "prefetch_factor": "auto",
     "pretrainG": "",
     "pretrainD": "",
 }

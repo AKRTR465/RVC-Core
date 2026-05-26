@@ -254,6 +254,14 @@ ckpt/mute/export/
 ckpt/mute/config.yaml
 ```
 
+TensorBoard 查看方式：
+
+```bash
+tensorboard --logdir ckpt/mute/train --port 6006
+```
+
+启动后在浏览器打开 `http://localhost:6006/`。训练标量和 mel 图都会写到 `ckpt/<name>/train/events.out.tfevents...`。
+
 训练会自动尝试从 `ckpt/mute/train/G_*.pth` 和 `D_*.pth` resume。想忽略已有 snapshot 重新解析配置，加 `--reset`：
 
 ```bash
