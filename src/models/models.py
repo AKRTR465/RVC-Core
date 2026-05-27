@@ -711,6 +711,42 @@ class SynthesizerTrnMs256NSFsid(nn.Module):
         o = self.dec(z_slice, pitchf, g=g)
         return o, ids_slice, x_mask, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q)
 
+    def forward_val(
+        self,
+        phone: torch.Tensor,
+        phone_lengths: torch.Tensor,
+        pitch: torch.Tensor,
+        pitchf: torch.Tensor,
+        y: torch.Tensor,
+        y_lengths: torch.Tensor,
+        ds: Optional[torch.Tensor] = None,
+    ):
+        g = self.emb_g(ds).unsqueeze(-1)
+        m_p, logs_p, x_mask = self.enc_p(phone, pitch, phone_lengths)
+        z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g)
+        z_p = self.flow(z, y_mask, g=g)
+        z_slice, ids_slice = commons.center_slice_segments(
+            z, y_lengths, self.segment_size
+        )
+        pitchf = commons.slice_segments2(pitchf, ids_slice, self.segment_size)
+        o = self.dec(z_slice, pitchf, g=g)
+        return o, ids_slice, x_mask, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q)
+
+    def reconstruct_full(
+        self,
+        phone: torch.Tensor,
+        phone_lengths: torch.Tensor,
+        pitch: torch.Tensor,
+        pitchf: torch.Tensor,
+        y: torch.Tensor,
+        y_lengths: torch.Tensor,
+        ds: Optional[torch.Tensor] = None,
+    ):
+        g = self.emb_g(ds).unsqueeze(-1)
+        z, _, _, y_mask = self.enc_q(y, y_lengths, g=g)
+        o = self.dec(z * y_mask, pitchf, g=g, n_res=y_lengths)
+        return o
+
     def infer(
         self,
         phone: torch.Tensor,
@@ -851,6 +887,23 @@ class SynthesizerTrnMs256NSFsid_nono(SynthesizerTrnMs256NSFsid):
         )
         o = self.dec(z_slice, g=g)
         return o, ids_slice, x_mask, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q)
+
+    def forward_val(self, phone, phone_lengths, y, y_lengths, ds):
+        g = self.emb_g(ds).unsqueeze(-1)
+        m_p, logs_p, x_mask = self.enc_p(phone, None, phone_lengths)
+        z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g)
+        z_p = self.flow(z, y_mask, g=g)
+        z_slice, ids_slice = commons.center_slice_segments(
+            z, y_lengths, self.segment_size
+        )
+        o = self.dec(z_slice, g=g)
+        return o, ids_slice, x_mask, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q)
+
+    def reconstruct_full(self, phone, phone_lengths, y, y_lengths, ds):
+        g = self.emb_g(ds).unsqueeze(-1)
+        z, _, _, y_mask = self.enc_q(y, y_lengths, g=g)
+        o = self.dec(z * y_mask, g=g, n_res=y_lengths)
+        return o
 
     def infer(
         self,

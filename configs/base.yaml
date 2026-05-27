@@ -1,5 +1,7 @@
 preprocess:
   noparallel: false
+  validation_split: 0.1
+  validation_seed: 1234
 
 runtime:
   device: auto

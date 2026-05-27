@@ -219,6 +219,60 @@ def plot_spectrogram_to_numpy(spectrogram):
     return data
 
 
+def plot_validation_mels_to_numpy(gt_mel, pred_mel, diff_mel):
+    global MATPLOTLIB_FLAG
+    if not MATPLOTLIB_FLAG:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        MATPLOTLIB_FLAG = True
+        mpl_logger = logging.getLogger("matplotlib")
+        mpl_logger.setLevel(logging.WARNING)
+    import matplotlib.pylab as plt
+    import numpy as np
+
+    gt_mel = np.asarray(gt_mel)
+    pred_mel = np.asarray(pred_mel)
+    diff_mel = np.asarray(diff_mel)
+
+    mel_min = float(min(np.min(gt_mel), np.min(pred_mel)))
+    mel_max = float(max(np.max(gt_mel), np.max(pred_mel)))
+    if mel_min == mel_max:
+        mel_max = mel_min + 1e-6
+
+    diff_abs_max = float(np.max(np.abs(diff_mel)))
+    if diff_abs_max == 0.0:
+        diff_abs_max = 1e-6
+
+    fig, axes = plt.subplots(3, 1, figsize=(10, 6), sharex=True)
+    panels = (
+        ("GT", gt_mel, "viridis", mel_min, mel_max),
+        ("PRED", pred_mel, "viridis", mel_min, mel_max),
+        ("DIFF", diff_mel, "seismic", -diff_abs_max, diff_abs_max),
+    )
+
+    for ax, (title, mel, cmap, vmin, vmax) in zip(axes, panels):
+        im = ax.imshow(
+            mel,
+            aspect="auto",
+            origin="lower",
+            interpolation="none",
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+        )
+        fig.colorbar(im, ax=ax)
+        ax.set_title(title)
+        ax.set_ylabel("Channels")
+
+    axes[-1].set_xlabel("Frames")
+    plt.tight_layout()
+
+    data = _figure_canvas_to_rgb_array(fig, np)
+    plt.close()
+    return data
+
+
 def plot_alignment_to_numpy(alignment, info=None):
     global MATPLOTLIB_FLAG
     if not MATPLOTLIB_FLAG:
@@ -376,6 +430,7 @@ def _build_hparams(config):
     hparams.experiment_dir = config["work_dir"]
     hparams.gpus = config.get("gpus", "0")
     hparams.data.training_files = config["training_files"]
+    hparams.data.validation_files = config["validation_files"]
     return hparams
 
 
@@ -460,6 +515,7 @@ def get_hparams(init=True):
 
     config.setdefault("data", {})
     config["data"]["training_files"] = project_config["training_files"]
+    config["data"]["validation_files"] = project_config["validation_files"]
     config = _apply_training_cli_overrides(config, args)
 
     config_save_path = _snapshot_path_for_project(config)

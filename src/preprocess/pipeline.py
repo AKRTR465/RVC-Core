@@ -4,6 +4,7 @@ import argparse
 import json
 import multiprocessing
 import os
+import random
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,6 +26,9 @@ AUDIO_EXTENSIONS = {
     ".opus",
 }
 F0_METHODS = {"pm", "harvest", "dio", "rmvpe"}
+FULL_FILELIST_NAME = "filelist.txt"
+TRAIN_FILELIST_NAME = "train_filelist.txt"
+VAL_FILELIST_NAME = "val_filelist.txt"
 
 
 @dataclass(frozen=True)
@@ -317,15 +321,13 @@ def _feature_dir(project: dict, preprocess_dir: Path) -> Path:
     )
 
 
-def generate_filelist(project: dict) -> tuple[Path, int, int]:
+def _build_filelist_rows(
+    project: dict,
+    records: list[dict],
+) -> tuple[list[str], int]:
     preprocess_dir = Path(project["preprocess_dir"])
     feature_dir = _feature_dir(project, preprocess_dir)
-    try:
-        records = load_preprocess_manifest(preprocess_dir)
-    except FileNotFoundError:
-        records = _legacy_manifest_records(project, preprocess_dir)
     use_f0 = _if_f0(project) == 1
-
     rows: list[str] = []
     skipped = 0
     for record in records:
@@ -351,15 +353,134 @@ def generate_filelist(project: dict) -> tuple[Path, int, int]:
         else:
             rows.append("|".join(map(str, [gt_wav, feature_path, sid])))
 
+    return rows, skipped
+
+
+def _resolve_validation_split(project: dict) -> float:
+    value = project.get("preprocess", {}).get("validation_split", 0.1)
+    try:
+        validation_split = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"preprocess.validation_split must be a float between 0 and 1, got: {value!r}"
+        ) from exc
+    if not 0.0 < validation_split < 1.0:
+        raise ValueError(
+            "preprocess.validation_split must be > 0 and < 1 "
+            f"to generate a required validation set, got: {validation_split}"
+        )
+    return validation_split
+
+
+def _resolve_validation_seed(project: dict) -> int:
+    value = project.get("preprocess", {}).get("validation_seed", 1234)
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"preprocess.validation_seed must be an integer, got: {value!r}"
+        ) from exc
+
+
+def _speaker_sort_key(value: str) -> tuple[int, int | str]:
+    text = str(value)
+    try:
+        return (0, int(text))
+    except ValueError:
+        return (1, text)
+
+
+def split_filelist_rows(
+    rows: list[str],
+    validation_split: float,
+    validation_seed: int,
+) -> tuple[list[str], list[str]]:
+    speaker_groups: dict[str, list[str]] = {}
+    for row in rows:
+        sid = row.split("|")[-1]
+        speaker_groups.setdefault(sid, []).append(row)
+
+    rng = random.Random(int(validation_seed))
+    grouped_train_lines: dict[str, list[str]] = {}
+    grouped_val_lines: dict[str, list[str]] = {}
+
+    for sid in sorted(speaker_groups.keys(), key=_speaker_sort_key):
+        group = list(speaker_groups[sid])
+        rng.shuffle(group)
+        if len(group) <= 1:
+            grouped_train_lines[sid] = group
+            grouped_val_lines[sid] = []
+            continue
+        n_val = int(len(group) * float(validation_split))
+        n_val = max(0, min(n_val, len(group) - 1))
+        grouped_val_lines[sid] = group[:n_val]
+        grouped_train_lines[sid] = group[n_val:]
+
+    val_lines = []
+    for sid in sorted(grouped_val_lines.keys(), key=_speaker_sort_key):
+        val_lines.extend(grouped_val_lines[sid])
+
+    if not val_lines:
+        donor_sids = [
+            sid
+            for sid in sorted(speaker_groups.keys(), key=_speaker_sort_key)
+            if len(speaker_groups[sid]) > 1 and grouped_train_lines.get(sid)
+        ]
+        if donor_sids:
+            best_sid = max(
+                donor_sids,
+                key=lambda sid: (len(speaker_groups[sid]), _speaker_sort_key(sid)),
+            )
+            grouped_val_lines[best_sid].append(grouped_train_lines[best_sid].pop(0))
+        else:
+            raise RuntimeError(
+                "Validation split produced no validation samples. "
+                "Add more data or adjust preprocess.validation_split."
+            )
+
+    train_lines: list[str] = []
+    val_lines = []
+    for sid in sorted(speaker_groups.keys(), key=_speaker_sort_key):
+        train_lines.extend(grouped_train_lines.get(sid, []))
+        val_lines.extend(grouped_val_lines.get(sid, []))
+
+    return train_lines, val_lines
+
+
+def generate_filelist(project: dict) -> tuple[Path, int, int]:
+    preprocess_dir = Path(project["preprocess_dir"])
+    try:
+        records = load_preprocess_manifest(preprocess_dir)
+    except FileNotFoundError:
+        records = _legacy_manifest_records(project, preprocess_dir)
+
+    rows, skipped = _build_filelist_rows(project, records)
+
     if not rows:
         raise RuntimeError(
             "No valid preprocess samples found for filelist. "
             f"manifest_rows={len(records)}, skipped={skipped}"
         )
 
-    filelist_path = preprocess_dir / "filelist.txt"
+    filelist_path = preprocess_dir / FULL_FILELIST_NAME
     filelist_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
     print(f"wrote filelist rows={len(rows)}, skipped={skipped}: {filelist_path}")
+
+    train_lines, val_lines = split_filelist_rows(
+        rows,
+        _resolve_validation_split(project),
+        _resolve_validation_seed(project),
+    )
+    train_filelist_path = preprocess_dir / TRAIN_FILELIST_NAME
+    val_filelist_path = preprocess_dir / VAL_FILELIST_NAME
+    train_filelist_path.write_text(
+        "\n".join(train_lines) + "\n", encoding="utf-8"
+    )
+    val_filelist_path.write_text(
+        "\n".join(val_lines) + "\n", encoding="utf-8"
+    )
+    print(f"wrote train filelist rows={len(train_lines)}: {train_filelist_path}")
+    print(f"wrote val filelist rows={len(val_lines)}: {val_filelist_path}")
     return filelist_path, len(rows), skipped
 
 

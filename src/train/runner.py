@@ -1,8 +1,8 @@
 import os
 import logging
 import sys
-
 import datetime
+from pathlib import Path
 
 from src.train import utils
 
@@ -223,6 +223,266 @@ def main(hps=None):
             raise RuntimeError(f"training worker {i} exited with code {children[i].exitcode}")
 
 
+def _unwrap_model(model):
+    return model.module if hasattr(model, "module") else model
+
+
+def trim_audio_to_length(audio, length):
+    return audio[..., : int(length)]
+
+
+def trim_mel_to_length(mel, length):
+    return mel[..., : int(length)]
+
+
+def build_ddsp_validation_audio_dict(sample_name, gt_audio, pred_audio):
+    return {
+        f"{sample_name}/gt.wav": gt_audio.float().detach().cpu(),
+        f"{sample_name}/pred.wav": pred_audio.float().detach().cpu(),
+    }
+
+
+def build_ddsp_validation_image_dict(sample_name, gt_mel, pred_mel):
+    gt_mel = gt_mel.float().detach().cpu()
+    pred_mel = pred_mel.float().detach().cpu()
+    diff_mel = pred_mel - gt_mel
+    return {
+        sample_name: utils.plot_validation_mels_to_numpy(
+            gt_mel.numpy(),
+            pred_mel.numpy(),
+            diff_mel.numpy(),
+        )
+    }
+
+
+def extract_validation_sample_names(info, use_f0):
+    expected_items = 9 if use_f0 else 7
+    if len(info) > expected_items:
+        extra = info[expected_items]
+        if isinstance(extra, (tuple, list)) and all(
+            isinstance(name, str) for name in extra
+        ):
+            return extra
+    return None
+
+
+def infer_full_validation_audio(
+    raw_g,
+    use_f0,
+    phone,
+    phone_lengths,
+    pitch,
+    pitchf,
+    sid,
+    spec_lengths,
+):
+    if use_f0:
+        audio, _, _ = raw_g.infer(
+            phone,
+            phone_lengths,
+            pitch,
+            pitchf,
+            sid,
+            return_length2=spec_lengths,
+        )
+    else:
+        audio, _, _ = raw_g.infer(
+            phone,
+            phone_lengths,
+            sid,
+            return_length2=spec_lengths,
+        )
+    return audio
+
+
+def validate(epoch, hps, nets, val_loader, writer, logger, global_step, amp_device_type):
+    net_g, net_d = nets
+    net_g.eval()
+    net_d.eval()
+
+    use_f0 = hps.if_f0 == 1
+    segment_size_frames = hps.train.segment_size // hps.data.hop_length
+
+    loss_disc_sum = 0.0
+    loss_gen_sum = 0.0
+    loss_fm_sum = 0.0
+    loss_mel_sum = 0.0
+    loss_kl_sum = 0.0
+    mel_val_mse_sum = 0.0
+    n_batches = 0
+
+    raw_g = _unwrap_model(net_g)
+    raw_d = _unwrap_model(net_d)
+
+    with torch.no_grad():
+        for batch_idx, info in enumerate(val_loader):
+            info = move_batch_to_device(info, 0, use_f0, include_wave_lengths=False)
+            sample_names = extract_validation_sample_names(info, use_f0)
+            (
+                phone, phone_lengths, pitch, pitchf,
+                spec, spec_lengths, wave, wave_lengths, sid,
+            ) = unpack_training_batch(info, use_f0)
+            sample_name = (
+                sample_names[0]
+                if sample_names is not None and len(sample_names) > 0
+                else f"sample_{batch_idx}"
+            )
+
+            with amp.autocast(amp_device_type, enabled=hps.train.fp16_run):
+                if use_f0:
+                    (
+                        y_hat, ids_slice, x_mask, z_mask,
+                        (z, z_p, m_p, logs_p, m_q, logs_q),
+                    ) = raw_g.forward_val(
+                        phone, phone_lengths, pitch, pitchf,
+                        spec, spec_lengths, sid,
+                    )
+                else:
+                    (
+                        y_hat, ids_slice, x_mask, z_mask,
+                        (z, z_p, m_p, logs_p, m_q, logs_q),
+                    ) = raw_g.forward_val(
+                        phone, phone_lengths, spec, spec_lengths, sid,
+                    )
+
+                mel = spec_to_mel_torch(
+                    spec,
+                    hps.data.filter_length,
+                    hps.data.n_mel_channels,
+                    hps.data.sampling_rate,
+                    hps.data.mel_fmin,
+                    hps.data.mel_fmax,
+                )
+                y_mel = commons.slice_segments(
+                    mel, ids_slice, segment_size_frames
+                )
+                with amp.autocast(amp_device_type, enabled=False):
+                    y_hat_mel = mel_spectrogram_torch(
+                        y_hat.float().squeeze(1),
+                        hps.data.filter_length,
+                        hps.data.n_mel_channels,
+                        hps.data.sampling_rate,
+                        hps.data.hop_length,
+                        hps.data.win_length,
+                        hps.data.mel_fmin,
+                        hps.data.mel_fmax,
+                    )
+                wave_slice = commons.slice_segments(
+                    wave, ids_slice * hps.data.hop_length, hps.train.segment_size
+                )
+
+                y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = raw_d(wave_slice, y_hat)
+                with amp.autocast(amp_device_type, enabled=False):
+                    loss_disc, _, _ = discriminator_loss(y_d_hat_r, y_d_hat_g)
+                    loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
+                    loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
+                    loss_fm = feature_loss(fmap_r, fmap_g)
+                    loss_gen, _ = generator_loss(y_d_hat_g)
+                    loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl
+                full_pred_audio = infer_full_validation_audio(
+                    raw_g,
+                    use_f0,
+                    phone,
+                    phone_lengths,
+                    pitch,
+                    pitchf,
+                    sid,
+                    spec_lengths,
+                )
+                full_pred_audio = full_pred_audio.float()
+                full_gt_audio = wave[0, 0].float()
+                target_wave_length = int(wave_lengths[0].item())
+                compare_wave_length = min(target_wave_length, int(full_pred_audio.size(-1)))
+                full_gt_audio = trim_audio_to_length(full_gt_audio, compare_wave_length)
+                full_pred_audio = trim_audio_to_length(
+                    full_pred_audio[0, 0],
+                    compare_wave_length,
+                )
+                full_gt_mel = mel_spectrogram_torch(
+                    full_gt_audio.unsqueeze(0),
+                    hps.data.filter_length,
+                    hps.data.n_mel_channels,
+                    hps.data.sampling_rate,
+                    hps.data.hop_length,
+                    hps.data.win_length,
+                    hps.data.mel_fmin,
+                    hps.data.mel_fmax,
+                )[0]
+                full_pred_mel = mel_spectrogram_torch(
+                    full_pred_audio.unsqueeze(0),
+                    hps.data.filter_length,
+                    hps.data.n_mel_channels,
+                    hps.data.sampling_rate,
+                    hps.data.hop_length,
+                    hps.data.win_length,
+                    hps.data.mel_fmin,
+                    hps.data.mel_fmax,
+                )[0]
+                mel_frame_length = min(full_gt_mel.size(-1), full_pred_mel.size(-1))
+                full_gt_mel = trim_mel_to_length(full_gt_mel, mel_frame_length)
+                full_pred_mel = trim_mel_to_length(full_pred_mel, mel_frame_length)
+                mel_val_mse = F.mse_loss(full_pred_mel, full_gt_mel)
+
+            loss_disc_sum += loss_disc.item()
+            loss_gen_sum += loss_gen_all.item()
+            loss_fm_sum += loss_fm.item()
+            loss_mel_sum += loss_mel.item()
+            loss_kl_sum += loss_kl.item()
+            mel_val_mse_sum += mel_val_mse.item()
+            n_batches += 1
+
+            if writer is not None:
+                utils.summarize(
+                    writer=writer,
+                    global_step=global_step,
+                    images=build_ddsp_validation_image_dict(
+                        sample_name,
+                        full_gt_mel,
+                        full_pred_mel,
+                    ),
+                    audios=build_ddsp_validation_audio_dict(
+                        sample_name,
+                        full_gt_audio,
+                        full_pred_audio,
+                    ),
+                    audio_sampling_rate=hps.data.sampling_rate,
+                )
+
+    net_g.train()
+    net_d.train()
+
+    if n_batches == 0:
+        return
+
+    scalar_dict = {
+        "validation/loss_d": loss_disc_sum / n_batches,
+        "validation/loss_g": loss_gen_sum / n_batches,
+        "validation/loss_fm": loss_fm_sum / n_batches,
+        "validation/loss_mel": loss_mel_sum / n_batches,
+        "validation/loss_kl": loss_kl_sum / n_batches,
+        "validation/mel_val_mse": mel_val_mse_sum / n_batches,
+    }
+
+    if writer is not None:
+        utils.summarize(
+            writer=writer,
+            global_step=global_step,
+            scalars=scalar_dict,
+        )
+
+    if logger is not None:
+        logger.info(
+            "Validation Epoch %d: loss_d=%.4f, loss_g=%.4f, loss_fm=%.4f, loss_mel=%.4f, loss_kl=%.4f, mel_val_mse=%.4f",
+            epoch,
+            loss_disc_sum / n_batches,
+            loss_gen_sum / n_batches,
+            loss_fm_sum / n_batches,
+            loss_mel_sum / n_batches,
+            loss_kl_sum / n_batches,
+            mel_val_mse_sum / n_batches,
+        )
+
+
 def run(rank, n_gpus, hps, logger: logging.Logger):
     global global_step
     use_distributed = n_gpus > 1
@@ -241,12 +501,14 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
         if torch.cuda.is_available():
             torch.cuda.set_device(rank)
 
+        val_loader = None
+        training_files = hps.data.training_files
+        val_filelist_path = hps.data.validation_files
+
         if hps.if_f0 == 1:
-            train_dataset = TextAudioLoaderMultiNSFsid(
-                hps.data.training_files, hps.data
-            )
+            train_dataset = TextAudioLoaderMultiNSFsid(training_files, hps.data)
         else:
-            train_dataset = TextAudioLoader(hps.data.training_files, hps.data)
+            train_dataset = TextAudioLoader(training_files, hps.data)
         train_sampler = DistributedBucketSampler(
             train_dataset,
             hps.train.batch_size,
@@ -268,6 +530,39 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
             batch_sampler=train_sampler,
             **dataloader_kwargs,
         )
+
+        if rank == 0:
+            val_filelist = Path(val_filelist_path)
+            if not val_filelist.is_file():
+                raise FileNotFoundError(
+                    f"Missing validation filelist: {val_filelist}. "
+                    "Run preprocessing to generate val_filelist.txt."
+                )
+            if hps.if_f0 == 1:
+                val_dataset = TextAudioLoaderMultiNSFsid(
+                    val_filelist_path,
+                    hps.data,
+                    return_sample_name=True,
+                    filelist_label="f0 validation",
+                )
+                val_collate_fn = TextAudioCollateMultiNSFsid(return_sample_names=True)
+            else:
+                val_dataset = TextAudioLoader(
+                    val_filelist_path,
+                    hps.data,
+                    return_sample_name=True,
+                    filelist_label="validation",
+                )
+                val_collate_fn = TextAudioCollate(return_sample_names=True)
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=1,
+                shuffle=False,
+                collate_fn=val_collate_fn,
+                num_workers=0,
+                pin_memory=False,
+            )
+
         if hps.if_f0 == 1:
             net_g = RVC_Model_f0(
                 hps.data.filter_length // 2 + 1,
@@ -378,26 +673,31 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
                     [net_g, net_d],
                     [optim_g, optim_d],
                     scaler,
-                train_loader,
-                logger,
-                writer,
-                cache,
-                amp_device_type,
-            )
-        else:
-            train_and_evaluate(
+                    train_loader,
+                    logger,
+                    writer,
+                    cache,
+                    amp_device_type,
+                )
+            else:
+                train_and_evaluate(
                     rank,
                     epoch,
                     hps,
                     [net_g, net_d],
                     [optim_g, optim_d],
                     scaler,
-                train_loader,
-                None,
-                None,
-                cache,
-                amp_device_type,
-            )
+                    train_loader,
+                    None,
+                    None,
+                    cache,
+                    amp_device_type,
+                )
+            if rank == 0 and epoch % hps.save_every_epoch == 0:
+                validate(
+                    epoch, hps, [net_g, net_d], val_loader,
+                    writer, logger, global_step, amp_device_type,
+                )
             scheduler_g.step()
             scheduler_d.step()
     finally:
@@ -449,9 +749,9 @@ def prepare_epoch_iterator(train_loader, cache, rank, hps):
 
 def unpack_training_batch(info, use_f0):
     if use_f0:
-        return info
+        return info[:9]
 
-    phone, phone_lengths, spec, spec_lengths, wave, wave_lengths, sid = info
+    phone, phone_lengths, spec, spec_lengths, wave, wave_lengths, sid = info[:7]
     return phone, phone_lengths, None, None, spec, spec_lengths, wave, wave_lengths, sid
 
 
@@ -743,4 +1043,3 @@ def save_final_checkpoint(rank, epoch, hps, net_g, logger):
 if __name__ == "__main__":
     torch.multiprocessing.set_start_method("spawn", force=True)
     main()
-

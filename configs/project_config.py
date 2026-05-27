@@ -20,6 +20,8 @@ SNAPSHOT_NAME = "config.yaml"
 
 DEFAULT_PREPROCESS = {
     "noparallel": False,
+    "validation_split": 0.1,
+    "validation_seed": 1234,
 }
 
 DEFAULT_RUNTIME = {
@@ -117,6 +119,7 @@ SNAPSHOT_EXCLUDE_TOP_LEVEL = {
     "experiment_dir",
     "ckpt_dir",
     "training_files",
+    "validation_files",
     "hubert_path",
     "rmvpe_path",
     "final_model_path",
@@ -155,6 +158,15 @@ REMOVED_TOP_LEVEL_FIELD_HINTS = {
     "experiment_dir": "Use work_dir instead.",
 }
 
+REMOVED_TRAIN_FIELD_HINTS = {
+    "validation_split": "Use preprocess.validation_split instead.",
+    "validation_seed": "Use preprocess.validation_seed instead.",
+    "validation_every_epoch": "Validation now runs every train.save_every_epoch.",
+    "validation_preview_index": "Validation now logs the full validation set.",
+    "train_filelist": "Training filelists are generated during preprocessing.",
+    "val_filelist": "Validation filelists are generated during preprocessing.",
+}
+
 
 class HparamsParseError(ValueError):
     pass
@@ -177,6 +189,13 @@ def _validate_config_mapping(raw: dict[str, Any], source: str) -> None:
             raise _top_level_key_error(key, source)
         if key in ROOT_SECTIONS and not isinstance(raw[key], dict):
             raise ValueError(f"Top-level key {key!r} in {source} must be a mapping")
+    train = raw.get("train")
+    if isinstance(train, dict):
+        for key, hint in REMOVED_TRAIN_FIELD_HINTS.items():
+            if key in train:
+                raise ValueError(
+                    f"Unsupported train key {key!r} in {source}. {hint}"
+                )
 
 
 def _read_yaml_file(path: Path) -> dict[str, Any]:
@@ -717,7 +736,8 @@ def _resolve_paths(path_config: dict[str, Any], name: str) -> dict[str, str]:
         "train_dir": str(train_dir),
         "export_dir": str(export_dir),
         "index_dir": str(index_dir),
-        "training_files": str(preprocess_dir / "filelist.txt"),
+        "training_files": str(preprocess_dir / "train_filelist.txt"),
+        "validation_files": str(preprocess_dir / "val_filelist.txt"),
         "preprocess_log_path": str(preprocess_dir / "preprocess.log"),
         "feature_log_path": str(preprocess_dir / "extract_f0_feature.log"),
         "final_model_name": final_model_name,
@@ -916,6 +936,7 @@ def load_project_config(
     }
 
     config["data"]["training_files"] = paths["training_files"]
+    config["data"]["validation_files"] = paths["validation_files"]
     config = _resolve_runtime_profile(config)
     config = _flatten_aliases(config)
     return config

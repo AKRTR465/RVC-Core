@@ -32,7 +32,9 @@ data/<name>/
     3_feature256/      # v1 HuBERT 特征
     3_feature768/      # v2 HuBERT 特征
     preprocess_manifest.jsonl
-    filelist.txt       # 训练 filelist
+    filelist.txt       # 完整样本总表
+    train_filelist.txt # 训练 filelist
+    val_filelist.txt   # 验证 filelist
 
 ckpt/<name>/
   train/               # G/D checkpoint、日志、TensorBoard
@@ -50,6 +52,11 @@ ckpt/<name>/
 ```bash
 pip install torch torchvision torchaudio
 pip install -r requirements.txt
+```
+
+回归测试建议直接使用 `RVC` conda 环境里的解释器：
+```bash
+F:\Anaconda3\envs\RVC\python.exe -m unittest discover -s tests
 ```
 
 Windows 上还需要能调用 `ffmpeg`/`ffprobe`。如果没有全局安装，可以把可执行文件放到项目根目录或加入 `PATH`。
@@ -95,6 +102,10 @@ selectors:
   version: v2          # v1 或 v2
   sample_rate: 48k     # v1: 32k/40k/48k；v2: 32k/48k
   if_f0: 1             # 1: 使用 F0；0: 不使用 F0
+
+preprocess:
+  validation_split: 0.1
+  validation_seed: 1234
 
 runtime:
   device: auto         # auto/cpu/cuda/cuda:0
@@ -144,7 +155,7 @@ data/mute/dataset/
 
 ### 2. 运行预处理流水线
 
-训练前只需要运行聚合入口。默认会依次执行音频规范化/重采样、F0、HuBERT 特征提取，并生成 `filelist.txt`：
+训练前只需要运行聚合入口。默认会依次执行音频规范化/重采样、F0、HuBERT 特征提取，并生成 `filelist.txt`、`train_filelist.txt` 和 `val_filelist.txt`：
 
 ```bash
 python -m src.preprocess --config configs/mute.yaml
@@ -185,9 +196,13 @@ data/mute/preprocess_data/3_feature256/   # v1
 data/mute/preprocess_data/3_feature768/   # v2
 data/mute/preprocess_data/preprocess_manifest.jsonl
 data/mute/preprocess_data/filelist.txt
+data/mute/preprocess_data/train_filelist.txt
+data/mute/preprocess_data/val_filelist.txt
 data/mute/preprocess_data/preprocess.log
 data/mute/preprocess_data/extract_f0_feature.log
 ```
+
+训练阶段只消费 `train_filelist.txt` 和 `val_filelist.txt`；`filelist.txt` 保留为完整总表，便于调试和重建切分。
 
 如果 `selectors.if_f0: 0`，聚合入口会跳过 F0 阶段，`filelist.txt` 会写 3 列：
 
@@ -308,7 +323,7 @@ python -m src.index -i data/mute/preprocess_data/3_feature256 -o ckpt/mute/index
 
 ### `No valid audio files found in training filelist`
 
-检查 `data/<name>/preprocess_data/filelist.txt` 是否存在、是否有行，以及每行路径是否真实存在。
+检查 `data/<name>/preprocess_data/train_filelist.txt` 是否存在、是否有行，以及每行路径是否真实存在。
 
 ### `Expected 5 columns` 或 `Expected 3 columns`
 

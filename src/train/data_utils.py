@@ -28,8 +28,17 @@ class _TextAudioLoaderBase(Dataset):
     expected_columns = 3
     filelist_label = "training"
 
-    def __init__(self, audiopaths_and_text, hparams):
+    def __init__(
+        self,
+        audiopaths_and_text,
+        hparams,
+        return_sample_name=False,
+        filelist_label=None,
+    ):
         self.audiopaths_and_text = load_filepaths_and_text(audiopaths_and_text)
+        self.return_sample_name = bool(return_sample_name)
+        if filelist_label is not None:
+            self.filelist_label = filelist_label
         for row in self.audiopaths_and_text:
             if len(row) != self.expected_columns:
                 raise ValueError(
@@ -69,6 +78,7 @@ class _TextAudioLoaderBase(Dataset):
 
         spec, wav = self.get_audio(file)
         sid = self.get_sid(sid)
+        sample_name = os.path.splitext(os.path.basename(file))[0]
         len_phone = phone.size(0)
         len_spec = spec.size(-1)
         lengths = [len_phone, len_spec]
@@ -85,7 +95,11 @@ class _TextAudioLoaderBase(Dataset):
                 pitchf = pitchf[:len_min]
 
         if self.has_f0:
+            if self.return_sample_name:
+                return spec, wav, phone, pitch, pitchf, sid, sample_name
             return spec, wav, phone, pitch, pitchf, sid
+        if self.return_sample_name:
+            return spec, wav, phone, sid, sample_name
         return spec, wav, phone, sid
 
     def get_labels(self, phone, pitch=None, pitchf=None):
@@ -160,8 +174,9 @@ class TextAudioLoader(_TextAudioLoaderBase):
 class _TextAudioCollateBase:
     has_f0 = False
 
-    def __init__(self, return_ids=False):
+    def __init__(self, return_ids=False, return_sample_names=False):
         self.return_ids = return_ids
+        self.return_sample_names = return_sample_names
 
     def __call__(self, batch):
         _, ids_sorted_decreasing = torch.sort(
@@ -179,6 +194,7 @@ class _TextAudioCollateBase:
         phone_lengths = torch.LongTensor(len(batch))
         phone_padded = torch.zeros(len(batch), max_phone_len, batch[0][2].shape[1])
         sid = torch.LongTensor(len(batch))
+        sample_names = [] if self.return_sample_names else None
         if self.has_f0:
             pitch_padded = torch.zeros(len(batch), max_phone_len, dtype=torch.long)
             pitchf_padded = torch.zeros(len(batch), max_phone_len)
@@ -197,8 +213,12 @@ class _TextAudioCollateBase:
                 pitch_padded[i, : pitch.size(0)] = pitch
                 pitchf_padded[i, : pitchf.size(0)] = pitchf
                 sid[i] = row[5].item()
+                if self.return_sample_names:
+                    sample_names.append(row[6])
             else:
                 sid[i] = row[3].item()
+                if self.return_sample_names:
+                    sample_names.append(row[4])
 
         if self.has_f0:
             result = (
@@ -222,7 +242,12 @@ class _TextAudioCollateBase:
                 wave_lengths,
                 sid,
             )
-        return result + (ids_sorted_decreasing,) if self.return_ids else result
+        extras = []
+        if self.return_sample_names:
+            extras.append(tuple(sample_names))
+        if self.return_ids:
+            extras.append(ids_sorted_decreasing)
+        return result + tuple(extras) if extras else result
 
 
 class TextAudioCollateMultiNSFsid(_TextAudioCollateBase):

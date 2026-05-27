@@ -94,6 +94,22 @@ def rand_slice_segments(x, x_lengths=None, segment_size=4):
     return ret, ids_str
 
 
+def center_slice_segments(x, x_lengths=None, segment_size=4):
+    b, d, t = x.size()
+    if x_lengths is None:
+        x_lengths = torch.full((b,), t, dtype=torch.long, device=x.device)
+    elif not torch.is_tensor(x_lengths):
+        x_lengths = torch.as_tensor(x_lengths, dtype=torch.long, device=x.device)
+    x_lengths = x_lengths.to(device=x.device)
+    if torch.any(x_lengths < segment_size):
+        raise ValueError(
+            f"All sequence lengths must be >= segment_size={segment_size}; got {x_lengths.tolist()}"
+        )
+    ids_str = ((x_lengths - segment_size) // 2).clamp(min=0).to(dtype=torch.long)
+    ret = slice_segments(x, ids_str, segment_size)
+    return ret, ids_str
+
+
 def get_timing_signal_1d(length, channels, min_timescale=1.0, max_timescale=1.0e4):
     position = torch.arange(length, dtype=torch.float)
     num_timescales = channels // 2
