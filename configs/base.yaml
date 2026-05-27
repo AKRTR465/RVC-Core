@@ -7,6 +7,9 @@ runtime:
   device: auto
   is_half: auto
   n_cpu: auto
+  deterministic_algorithms: off
+  disable_tf32: false
+  cublas_workspace_config: null
   slice:
     x_pad: auto
     x_query: auto
@@ -40,6 +43,8 @@ train:
   pretrainD: ""
   log_interval: 200
   seed: 1234
+  numeric_backend: native
+  grad_scaler_init_scale: 32.0
   epochs: 20000
   learning_rate: 1.0e-4
   betas: [0.8, 0.99]

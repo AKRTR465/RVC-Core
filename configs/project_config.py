@@ -28,6 +28,9 @@ DEFAULT_RUNTIME = {
     "device": "auto",
     "is_half": "auto",
     "n_cpu": "auto",
+    "deterministic_algorithms": "off",
+    "disable_tf32": False,
+    "cublas_workspace_config": None,
     "slice": {
         "x_pad": "auto",
         "x_query": "auto",
@@ -62,6 +65,8 @@ DEFAULT_TRAIN = {
     "prefetch_factor": "auto",
     "pretrainG": "",
     "pretrainD": "",
+    "numeric_backend": "native",
+    "grad_scaler_init_scale": 32.0,
 }
 
 VALID_SAMPLE_RATES = {
@@ -363,6 +368,18 @@ def _normalize_auto_bool(value: Any, field_name: str) -> str | bool:
     raise ValueError(f"{field_name} must be auto|true|false, got: {value!r}")
 
 
+def _normalize_bool(value: Any, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(int(value))
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"{field_name} must be true|false, got: {value!r}")
+
 
 def _normalize_auto_int(value: Any, field_name: str) -> str | int:
     if value in (None, "", "auto"):
@@ -399,6 +416,47 @@ def _normalize_device_request(value: Any) -> str:
         return device
     raise ValueError(f"runtime.device must be auto|cpu|cuda[:index], got: {value!r}")
 
+
+
+def _normalize_deterministic_algorithms(value: Any) -> str:
+    if isinstance(value, bool):
+        return "error" if value else "off"
+    text = str(value).strip().lower()
+    if text in {"", "none"}:
+        return "off"
+    if text not in {"off", "warn_only", "error"}:
+        raise ValueError(
+            "runtime.deterministic_algorithms must be off|warn_only|error, "
+            f"got: {value!r}"
+        )
+    return text
+
+
+def _normalize_numeric_backend(value: Any) -> str:
+    text = str(value if value is not None else "native").strip().lower()
+    if text in {"", "none"}:
+        return "native"
+    if text == "cpu":
+        raise ValueError(
+            "train.mel_loss_device=cpu is only supported by equal-test alignment runs. "
+            "Use train.numeric_backend=native or deterministic_gpu in RVC_rebuild."
+        )
+    if text not in {"native", "deterministic_gpu"}:
+        raise ValueError(
+            "train.numeric_backend must be native|deterministic_gpu, "
+            f"got: {value!r}"
+        )
+    return text
+
+
+def _normalize_positive_float(value: Any, field_name: str) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a positive float, got: {value!r}") from exc
+    if number <= 0.0:
+        raise ValueError(f"{field_name} must be > 0, got: {number}")
+    return number
 
 
 def _expand_path(value: Any) -> Path:
@@ -640,6 +698,16 @@ def _resolve_runtime_profile(config: dict[str, Any]) -> dict[str, Any]:
     runtime["device_request"] = _normalize_device_request(runtime.get("device"))
     runtime["is_half_request"] = _normalize_auto_bool(runtime.get("is_half"), "runtime.is_half")
     runtime["n_cpu_request"] = _normalize_auto_int(runtime.get("n_cpu"), "runtime.n_cpu")
+    runtime["deterministic_algorithms"] = _normalize_deterministic_algorithms(
+        runtime.get("deterministic_algorithms", "off")
+    )
+    runtime["disable_tf32"] = _normalize_bool(
+        runtime.get("disable_tf32", False), "runtime.disable_tf32"
+    )
+    workspace_config = runtime.get("cublas_workspace_config")
+    runtime["cublas_workspace_config"] = (
+        None if workspace_config in (None, "") else str(workspace_config)
+    )
 
     slice_block = copy.deepcopy(runtime.get("slice") or {})
     runtime["slice"] = {
@@ -650,6 +718,15 @@ def _resolve_runtime_profile(config: dict[str, Any]) -> dict[str, Any]:
     }
 
     train["fp16_run_request"] = _normalize_auto_bool(train.get("fp16_run"), "train.fp16_run")
+    requested_numeric_backend = train.get("mel_loss_device")
+    if requested_numeric_backend in (None, ""):
+        requested_numeric_backend = train.get("numeric_backend", "native")
+    train["numeric_backend"] = _normalize_numeric_backend(requested_numeric_backend)
+    train.pop("mel_loss_device", None)
+    train["grad_scaler_init_scale"] = _normalize_positive_float(
+        train.get("grad_scaler_init_scale", DEFAULT_TRAIN["grad_scaler_init_scale"]),
+        "train.grad_scaler_init_scale",
+    )
 
     environment = _detect_runtime_environment(runtime["device_request"])
     runtime["device"] = environment["device"]
@@ -702,8 +779,29 @@ def _resolve_runtime_profile(config: dict[str, Any]) -> dict[str, Any]:
         resolved_slice[key] = auto_slice[key] if value == "auto" else int(value)
     runtime["slice"] = resolved_slice
 
+    if train["numeric_backend"] == "deterministic_gpu":
+        if runtime["device"] == "cpu":
+            raise RuntimeError("train.numeric_backend=deterministic_gpu requires a CUDA device")
+        if runtime["deterministic_algorithms"] == "off":
+            runtime["deterministic_algorithms"] = "error"
+        if runtime["cublas_workspace_config"] is None:
+            runtime["cublas_workspace_config"] = ":4096:8"
+        runtime["disable_tf32"] = True
+
     config["runtime"] = runtime
     config["train"] = train
+    replayable_config = config.get("replayable_config")
+    if isinstance(replayable_config, dict):
+        replayable_train = replayable_config.get("train")
+        if isinstance(replayable_train, dict):
+            replayable_train["numeric_backend"] = train["numeric_backend"]
+            replayable_train["grad_scaler_init_scale"] = train["grad_scaler_init_scale"]
+            replayable_train.pop("mel_loss_device", None)
+        replayable_runtime = replayable_config.get("runtime")
+        if isinstance(replayable_runtime, dict):
+            replayable_runtime["deterministic_algorithms"] = runtime["deterministic_algorithms"]
+            replayable_runtime["disable_tf32"] = runtime["disable_tf32"]
+            replayable_runtime["cublas_workspace_config"] = runtime["cublas_workspace_config"]
     return config
 
 
@@ -841,6 +939,7 @@ def _sanitize_snapshot_payload(payload: dict[str, Any]) -> dict[str, Any]:
     train = snapshot.get("train")
     if isinstance(train, dict):
         train.pop("fp16_run_request", None)
+        train.pop("mel_loss_device", None)
 
     for key in list(snapshot.keys()):
         if key in SNAPSHOT_EXCLUDE_TOP_LEVEL:

@@ -68,7 +68,7 @@ def load_checkpoint_d(checkpoint_path, combd, sbd, optimizer=None, load_opt=1):
     logger.info("Loaded checkpoint '{}' (epoch {})".format(checkpoint_path, iteration))
     return model, optimizer, learning_rate, iteration
 
-def load_checkpoint(checkpoint_path, model, optimizer=None, load_opt=1):
+def load_checkpoint(checkpoint_path, model, optimizer=None, load_opt=1, scaler=None):
     if not os.path.isfile(checkpoint_path):
         raise FileNotFoundError(checkpoint_path)
     checkpoint_dict = torch.load(checkpoint_path, map_location="cpu")
@@ -105,11 +105,20 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, load_opt=1):
         optimizer is not None and load_opt == 1
     ):  ###加载不了，如果是空的的话，重新初始化，可能还会影响lr时间表的更新，因此在train文件最外围catch
         optimizer.load_state_dict(checkpoint_dict["optimizer"])
+    if scaler is not None and load_opt == 1:
+        scaler_state = checkpoint_dict.get("scaler")
+        if scaler_state is None:
+            logger.warning(
+                "Checkpoint '%s' is missing GradScaler state; resuming with a fresh scaler.",
+                checkpoint_path,
+            )
+        else:
+            scaler.load_state_dict(scaler_state)
     logger.info("Loaded checkpoint '{}' (epoch {})".format(checkpoint_path, iteration))
     return model, optimizer, learning_rate, iteration
 
 
-def save_checkpoint(model, optimizer, learning_rate, iteration, checkpoint_path):
+def save_checkpoint(model, optimizer, learning_rate, iteration, checkpoint_path, scaler=None):
     logger.info(
         "Saving model and optimizer state at epoch {} to {}".format(
             iteration, checkpoint_path
@@ -125,6 +134,7 @@ def save_checkpoint(model, optimizer, learning_rate, iteration, checkpoint_path)
             "iteration": iteration,
             "optimizer": optimizer.state_dict(),
             "learning_rate": learning_rate,
+            "scaler": scaler.state_dict() if scaler is not None else None,
         },
         checkpoint_path,
     )

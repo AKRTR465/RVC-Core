@@ -2,8 +2,11 @@ import os
 import logging
 import sys
 import datetime
+import math
+import random
 from pathlib import Path
 
+import numpy as np
 from src.train import utils
 
 from random import randint, shuffle
@@ -48,8 +51,13 @@ from src.train.losses import (
     generator_loss,
     kl_loss,
 )
-from src.train.mel_processing import mel_spectrogram_torch, spec_to_mel_torch
+from src.train import mel_processing
 from src.train.checkpoint_export import savee
+from src.train.deterministic_gpu import (
+    apply_deterministic_gpu_patches,
+    reset_backend_runtime_overrides,
+    reset_deterministic_caches,
+)
 
 global_step = 0
 
@@ -162,6 +170,118 @@ def format_progress_metrics(global_step, lr, loss_disc, loss_gen, loss_mel, loss
     }
 
 
+def _numeric_backend(hps) -> str:
+    return str(getattr(hps.train, "numeric_backend", "native")).strip().lower()
+
+
+def _strict_repro_mode(hps) -> bool:
+    return _numeric_backend(hps) == "deterministic_gpu"
+
+
+def _step_seed(base_seed: int, epoch: int, batch_idx: int) -> int:
+    return int(base_seed) + int(epoch) * 100000 + int(batch_idx)
+
+
+def _seed_everything(seed: int) -> None:
+    os.environ["PYTHONHASHSEED"] = str(int(seed))
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+
+def _seed_torch_for_step(seed: int) -> None:
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+
+def configure_torch_runtime(runtime) -> None:
+    deterministic_mode = str(
+        getattr(runtime, "deterministic_algorithms", "off")
+    ).strip().lower()
+    if deterministic_mode not in {"off", "warn_only", "error"}:
+        raise ValueError(
+            f"Unsupported runtime.deterministic_algorithms={deterministic_mode!r}"
+        )
+
+    workspace_config = getattr(runtime, "cublas_workspace_config", None)
+    if workspace_config:
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = str(workspace_config)
+
+    disable_tf32 = bool(getattr(runtime, "disable_tf32", False))
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+        torch.backends.cuda.matmul.allow_tf32 = not disable_tf32
+    torch.backends.cudnn.allow_tf32 = not disable_tf32
+    torch.backends.cudnn.deterministic = deterministic_mode != "off"
+    torch.backends.cudnn.benchmark = False
+
+    if deterministic_mode == "off":
+        torch.use_deterministic_algorithms(False)
+    elif deterministic_mode == "warn_only":
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    else:
+        torch.use_deterministic_algorithms(True)
+
+
+def _compute_y_hat_mel(hps, y_hat, amp_device_type):
+    with amp.autocast(amp_device_type, enabled=False):
+        return mel_processing.mel_spectrogram_torch(
+            y_hat.float().squeeze(1),
+            hps.data.filter_length,
+            hps.data.n_mel_channels,
+            hps.data.sampling_rate,
+            hps.data.hop_length,
+            hps.data.win_length,
+            hps.data.mel_fmin,
+            hps.data.mel_fmax,
+        )
+
+
+def _compute_loss_mel(y_mel, y_hat_mel, hps):
+    if _numeric_backend(hps) == "native" and hps.train.fp16_run:
+        y_hat_mel = y_hat_mel.half()
+    return F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
+
+
+def _raise_if_non_finite_loss(name, value):
+    scalar = value.detach().float()
+    if not torch.isfinite(scalar).all():
+        raise FloatingPointError(f"Non-finite {name}: {scalar.item()}")
+
+
+def _raise_if_non_finite_gradients(model, label):
+    nan_params = 0
+    inf_params = 0
+    first_nan: list[str] = []
+    first_inf: list[str] = []
+    for name, param in model.named_parameters():
+        grad = param.grad
+        if grad is None:
+            continue
+        if torch.isnan(grad).any():
+            nan_params += 1
+            if len(first_nan) < 5:
+                first_nan.append(name)
+        elif torch.isinf(grad).any():
+            inf_params += 1
+            if len(first_inf) < 5:
+                first_inf.append(name)
+    if nan_params or inf_params:
+        raise FloatingPointError(
+            f"Non-finite gradients in {label}: nan_param_count={nan_params} "
+            f"inf_param_count={inf_params} first_nan={first_nan} first_inf={first_inf}"
+        )
+
+
+def _raise_if_non_finite_norm(label, value):
+    if not math.isfinite(float(value)):
+        raise FloatingPointError(f"Non-finite {label}: {value}")
+
+
 def resolve_model_classes(version):
     if version == "v1":
         return (
@@ -195,7 +315,15 @@ def main(hps=None):
     if hps is None:
         hps = utils.get_hparams()
     os.environ["CUDA_VISIBLE_DEVICES"] = hps.gpus.replace("-", ",")
+    configure_torch_runtime(hps.runtime)
     n_gpus = torch.cuda.device_count()
+    if _strict_repro_mode(hps):
+        if not torch.cuda.is_available():
+            raise RuntimeError("train.numeric_backend=deterministic_gpu requires CUDA")
+        if n_gpus != 1:
+            raise RuntimeError(
+                "train.numeric_backend=deterministic_gpu only supports a single visible GPU"
+            )
     if n_gpus < 1:
         # patch to unblock people without gpus. there is probably a better way.
         print("NO GPU DETECTED: falling back to CPU - this may take a while")
@@ -299,6 +427,8 @@ def validate(epoch, hps, nets, val_loader, writer, logger, global_step, amp_devi
     net_g, net_d = nets
     net_g.eval()
     net_d.eval()
+    if _strict_repro_mode(hps):
+        reset_deterministic_caches()
 
     use_f0 = hps.if_f0 == 1
     segment_size_frames = hps.train.segment_size // hps.data.hop_length
@@ -316,6 +446,8 @@ def validate(epoch, hps, nets, val_loader, writer, logger, global_step, amp_devi
 
     with torch.no_grad():
         for batch_idx, info in enumerate(val_loader):
+            if _strict_repro_mode(hps):
+                _seed_torch_for_step(_step_seed(hps.train.seed, epoch, batch_idx))
             info = move_batch_to_device(info, 0, use_f0, include_wave_lengths=False)
             sample_names = extract_validation_sample_names(info, use_f0)
             (
@@ -345,7 +477,7 @@ def validate(epoch, hps, nets, val_loader, writer, logger, global_step, amp_devi
                         phone, phone_lengths, spec, spec_lengths, sid,
                     )
 
-                mel = spec_to_mel_torch(
+                mel = mel_processing.spec_to_mel_torch(
                     spec,
                     hps.data.filter_length,
                     hps.data.n_mel_channels,
@@ -356,17 +488,7 @@ def validate(epoch, hps, nets, val_loader, writer, logger, global_step, amp_devi
                 y_mel = commons.slice_segments(
                     mel, ids_slice, segment_size_frames
                 )
-                with amp.autocast(amp_device_type, enabled=False):
-                    y_hat_mel = mel_spectrogram_torch(
-                        y_hat.float().squeeze(1),
-                        hps.data.filter_length,
-                        hps.data.n_mel_channels,
-                        hps.data.sampling_rate,
-                        hps.data.hop_length,
-                        hps.data.win_length,
-                        hps.data.mel_fmin,
-                        hps.data.mel_fmax,
-                    )
+                y_hat_mel = _compute_y_hat_mel(hps, y_hat, amp_device_type)
                 wave_slice = commons.slice_segments(
                     wave, ids_slice * hps.data.hop_length, hps.train.segment_size
                 )
@@ -374,7 +496,7 @@ def validate(epoch, hps, nets, val_loader, writer, logger, global_step, amp_devi
                 y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = raw_d(wave_slice, y_hat)
                 with amp.autocast(amp_device_type, enabled=False):
                     loss_disc, _, _ = discriminator_loss(y_d_hat_r, y_d_hat_g)
-                    loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
+                    loss_mel = _compute_loss_mel(y_mel, y_hat_mel, hps)
                     loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
                     loss_fm = feature_loss(fmap_r, fmap_g)
                     loss_gen, _ = generator_loss(y_d_hat_g)
@@ -398,7 +520,7 @@ def validate(epoch, hps, nets, val_loader, writer, logger, global_step, amp_devi
                     full_pred_audio[0, 0],
                     compare_wave_length,
                 )
-                full_gt_mel = mel_spectrogram_torch(
+                full_gt_mel = mel_processing.mel_spectrogram_torch(
                     full_gt_audio.unsqueeze(0),
                     hps.data.filter_length,
                     hps.data.n_mel_channels,
@@ -408,7 +530,7 @@ def validate(epoch, hps, nets, val_loader, writer, logger, global_step, amp_devi
                     hps.data.mel_fmin,
                     hps.data.mel_fmax,
                 )[0]
-                full_pred_mel = mel_spectrogram_torch(
+                full_pred_mel = mel_processing.mel_spectrogram_torch(
                     full_pred_audio.unsqueeze(0),
                     hps.data.filter_length,
                     hps.data.n_mel_channels,
@@ -486,18 +608,29 @@ def validate(epoch, hps, nets, val_loader, writer, logger, global_step, amp_devi
 def run(rank, n_gpus, hps, logger: logging.Logger):
     global global_step
     use_distributed = n_gpus > 1
+    if _strict_repro_mode(hps) and use_distributed:
+        raise RuntimeError(
+            "train.numeric_backend=deterministic_gpu only supports single-process training"
+        )
     RVC_Model_f0, RVC_Model_nof0, Discriminator = resolve_model_classes(hps.version)
     writer = None
+    applied_runtime = []
     try:
+        configure_torch_runtime(hps.runtime)
+        reset_backend_runtime_overrides()
+        reset_deterministic_caches()
+        applied_runtime = apply_deterministic_gpu_patches(hps)
         if rank == 0:
             logger.info(hps)
             writer = SummaryWriter(log_dir=hps.model_dir)
+            if applied_runtime:
+                logger.info("applied runtime overrides: %s", applied_runtime)
 
         if use_distributed:
             dist.init_process_group(
                 backend="gloo", init_method="env://", world_size=n_gpus, rank=rank
             )
-        torch.manual_seed(hps.train.seed)
+        _seed_everything(hps.train.seed)
         if torch.cuda.is_available():
             torch.cuda.set_device(rank)
 
@@ -603,6 +736,13 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
                 net_g = DDP(net_g)
                 net_d = DDP(net_d)
 
+        amp_device_type = "cuda" if torch.cuda.is_available() else "cpu"
+        scaler = amp.GradScaler(
+            amp_device_type,
+            enabled=hps.train.fp16_run,
+            init_scale=float(hps.train.grad_scaler_init_scale),
+        )
+
         try:
             d_checkpoint = utils.latest_checkpoint_path(hps.model_dir, "D_*.pth")
             g_checkpoint = utils.latest_checkpoint_path(hps.model_dir, "G_*.pth")
@@ -616,7 +756,7 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
             if rank == 0:
                 logger.info("loaded D")
             _, _, _, epoch_str = utils.load_checkpoint(
-                g_checkpoint, net_g, optim_g
+                g_checkpoint, net_g, optim_g, scaler=scaler
             )
             global_step = (epoch_str - 1) * len(train_loader)
         else:
@@ -659,9 +799,13 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
         scheduler_d = torch.optim.lr_scheduler.ExponentialLR(
             optim_d, gamma=hps.train.lr_decay, last_epoch=epoch_str - 2
         )
-
-        amp_device_type = "cuda" if torch.cuda.is_available() else "cpu"
-        scaler = amp.GradScaler(amp_device_type, enabled=hps.train.fp16_run)
+        if rank == 0:
+            logger.info(
+                "start training numeric_backend=%s deterministic_algorithms=%s grad_scaler_init_scale=%.1f",
+                _numeric_backend(hps),
+                getattr(hps.runtime, "deterministic_algorithms", "off"),
+                float(hps.train.grad_scaler_init_scale),
+            )
 
         cache = []
         for epoch in range(epoch_str, hps.train.epochs + 1):
@@ -701,6 +845,8 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
             scheduler_g.step()
             scheduler_d.step()
     finally:
+        reset_backend_runtime_overrides()
+        reset_deterministic_caches()
         if writer is not None:
             writer.flush()
             writer.close()
@@ -770,6 +916,7 @@ def train_and_evaluate(
 ):
     net_g, net_d = nets
     optim_g, optim_d = optims
+    strict_mode = _strict_repro_mode(hps)
 
     train_loader.batch_sampler.set_epoch(epoch)
     global global_step
@@ -792,6 +939,8 @@ def train_and_evaluate(
     epoch_recorder = EpochRecorder()
     try:
         for batch_idx, info in data_iterator:
+            if strict_mode:
+                _seed_torch_for_step(_step_seed(hps.train.seed, epoch, batch_idx))
             if not hps.if_cache_data_in_gpu:
                 info = move_batch_to_device(
                     info, rank, use_f0, include_wave_lengths=False
@@ -826,7 +975,7 @@ def train_and_evaluate(
                         z_mask,
                         (z, z_p, m_p, logs_p, m_q, logs_q),
                     ) = net_g(phone, phone_lengths, spec, spec_lengths, sid)
-                mel = spec_to_mel_torch(
+                mel = mel_processing.spec_to_mel_torch(
                     spec,
                     hps.data.filter_length,
                     hps.data.n_mel_channels,
@@ -837,19 +986,7 @@ def train_and_evaluate(
                 y_mel = commons.slice_segments(
                     mel, ids_slice, hps.train.segment_size // hps.data.hop_length
                 )
-                with amp.autocast(amp_device_type, enabled=False):
-                    y_hat_mel = mel_spectrogram_torch(
-                        y_hat.float().squeeze(1),
-                        hps.data.filter_length,
-                        hps.data.n_mel_channels,
-                        hps.data.sampling_rate,
-                        hps.data.hop_length,
-                        hps.data.win_length,
-                        hps.data.mel_fmin,
-                        hps.data.mel_fmax,
-                    )
-                if hps.train.fp16_run:
-                    y_hat_mel = y_hat_mel.half()
+                y_hat_mel = _compute_y_hat_mel(hps, y_hat, amp_device_type)
                 wave = commons.slice_segments(
                     wave, ids_slice * hps.data.hop_length, hps.train.segment_size
                 )  # slice
@@ -860,25 +997,35 @@ def train_and_evaluate(
                     loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(
                         y_d_hat_r, y_d_hat_g
                     )
+            _raise_if_non_finite_loss("loss_disc", loss_disc)
             optim_d.zero_grad()
             scaler.scale(loss_disc).backward()
             scaler.unscale_(optim_d)
             grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
+            _raise_if_non_finite_gradients(net_d, "discriminator")
+            _raise_if_non_finite_norm("grad_norm_d", grad_norm_d)
             scaler.step(optim_d)
 
             with amp.autocast(amp_device_type, enabled=hps.train.fp16_run):
                 # Generator
                 y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(wave, y_hat)
                 with amp.autocast(amp_device_type, enabled=False):
-                    loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
+                    loss_mel = _compute_loss_mel(y_mel, y_hat_mel, hps)
                     loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
                     loss_fm = feature_loss(fmap_r, fmap_g)
                     loss_gen, losses_gen = generator_loss(y_d_hat_g)
                     loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl
+            _raise_if_non_finite_loss("loss_gen", loss_gen)
+            _raise_if_non_finite_loss("loss_fm", loss_fm)
+            _raise_if_non_finite_loss("loss_mel", loss_mel)
+            _raise_if_non_finite_loss("loss_kl", loss_kl)
+            _raise_if_non_finite_loss("loss_gen_all", loss_gen_all)
             optim_g.zero_grad()
             scaler.scale(loss_gen_all).backward()
             scaler.unscale_(optim_g)
             grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
+            _raise_if_non_finite_gradients(net_g, "generator")
+            _raise_if_non_finite_norm("grad_norm_g", grad_norm_g)
             scaler.step(optim_g)
             scaler.update()
 
@@ -958,7 +1105,7 @@ def train_and_evaluate(
     # /Run steps
 
     save_epoch_checkpoints(
-        rank, epoch, hps, net_g, net_d, optim_g, optim_d, logger, global_step
+        rank, epoch, hps, net_g, net_d, optim_g, optim_d, scaler, logger, global_step
     )
 
     if rank == 0 and logger is not None:
@@ -973,7 +1120,7 @@ def model_state_dict(model):
 
 
 def save_epoch_checkpoints(
-    rank, epoch, hps, net_g, net_d, optim_g, optim_d, logger, step
+    rank, epoch, hps, net_g, net_d, optim_g, optim_d, scaler, logger, step
 ):
     if epoch % hps.save_every_epoch != 0 or rank != 0:
         return
@@ -985,6 +1132,7 @@ def save_epoch_checkpoints(
         hps.train.learning_rate,
         epoch,
         os.path.join(hps.model_dir, "G_{}.pth".format(checkpoint_step)),
+        scaler=scaler,
     )
     utils.save_checkpoint(
         net_d,
@@ -992,6 +1140,7 @@ def save_epoch_checkpoints(
         hps.train.learning_rate,
         epoch,
         os.path.join(hps.model_dir, "D_{}.pth".format(checkpoint_step)),
+        scaler=scaler,
     )
     if hps.save_every_weights == "1" and logger is not None:
         logger.info(
