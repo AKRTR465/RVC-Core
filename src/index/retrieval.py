@@ -2,6 +2,8 @@ from pathlib import Path
 
 import numpy as np
 
+from src.index.common import load_source_matrix
+
 
 def load_retrieval_index(index_file):
     import faiss
@@ -11,25 +13,10 @@ def load_retrieval_index(index_file):
     if index.ntotal <= 0:
         raise ValueError(f"Retrieval index is empty: {index_path}")
 
-    source_path = index_path.resolve().parent / "big_src_feature.npy"
-    if not source_path.is_file():
-        raise FileNotFoundError(
-            f"Retrieval source matrix is required next to the index: {source_path}"
-        )
-    source = np.load(source_path, allow_pickle=False)
-
-    source = np.ascontiguousarray(source, dtype=np.float32)
-    if source.ndim != 2:
-        raise ValueError(f"Source feature matrix must be 2-D: {source_path}")
-    if not np.isfinite(source).all():
-        raise ValueError(f"Source feature matrix contains non-finite values: {source_path}")
+    source = load_source_matrix(index_path.resolve().parent, feature_dim=getattr(index, "d", None))
     if source.shape[0] < index.ntotal:
         raise ValueError(
             f"Source feature rows {source.shape[0]} fewer than index entries {index.ntotal}"
-        )
-    if hasattr(index, "d") and source.shape[1] != index.d:
-        raise ValueError(
-            f"Source feature dim {source.shape[1]} does not match index dim {index.d}"
         )
     return index, source
 

@@ -27,6 +27,7 @@ class SourceCoverageEquivalenceTest(unittest.TestCase):
     def test_legacy_infer_tree_is_removed(self):
         self.assertFalse((REPO_ROOT / "infer").exists())
         self.assertFalse((REPO_ROOT / "src/infer/batch.py").exists())
+        self.assertFalse((REPO_ROOT / "src/infer/model_utils.py").exists())
         self.assertFalse((REPO_ROOT / "src/infer/service.py").exists())
         self.assertFalse((REPO_ROOT / "src/infer/voice_converter.py").exists())
         self.assertFalse((REPO_ROOT / "src/train/process_ckpt.py").exists())

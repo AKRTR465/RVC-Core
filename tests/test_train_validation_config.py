@@ -8,7 +8,13 @@ import yaml
 
 from configs.project_config import load_project_config, save_project_config_snapshot
 from src.models.commons import center_slice_segments
-from src.models.models import SynthesizerTrnMs256NSFsid, SynthesizerTrnMs256NSFsid_nono
+from src.models.models import (
+    SynthesizerTrnMs256NSFsid,
+    SynthesizerTrnMs256NSFsid_nono,
+    SynthesizerTrnMs768NSFsid,
+    SynthesizerTrnMs768NSFsid_nono,
+)
+from src.train.data_utils import TrainingBatch
 from src.train.runner import (
     build_ddsp_validation_audio_dict,
     build_ddsp_validation_image_dict,
@@ -62,6 +68,53 @@ def build_tiny_f0_model():
 
 def build_tiny_nof0_model():
     return SynthesizerTrnMs256NSFsid_nono(
+        spec_channels=5,
+        segment_size=4,
+        inter_channels=8,
+        hidden_channels=8,
+        filter_channels=16,
+        n_heads=1,
+        n_layers=1,
+        kernel_size=3,
+        p_dropout=0.0,
+        resblock="1",
+        resblock_kernel_sizes=[3],
+        resblock_dilation_sizes=[[1, 1, 1]],
+        upsample_rates=[2, 2],
+        upsample_initial_channel=16,
+        upsample_kernel_sizes=[4, 4],
+        spk_embed_dim=2,
+        gin_channels=4,
+        is_half=False,
+    )
+
+
+def build_tiny_f0_model_768():
+    return SynthesizerTrnMs768NSFsid(
+        spec_channels=5,
+        segment_size=4,
+        inter_channels=8,
+        hidden_channels=8,
+        filter_channels=16,
+        n_heads=1,
+        n_layers=1,
+        kernel_size=3,
+        p_dropout=0.0,
+        resblock="1",
+        resblock_kernel_sizes=[3],
+        resblock_dilation_sizes=[[1, 1, 1]],
+        upsample_rates=[2, 2],
+        upsample_initial_channel=16,
+        upsample_kernel_sizes=[4, 4],
+        spk_embed_dim=2,
+        gin_channels=4,
+        sr=32000,
+        is_half=False,
+    )
+
+
+def build_tiny_nof0_model_768():
+    return SynthesizerTrnMs768NSFsid_nono(
         spec_channels=5,
         segment_size=4,
         inter_channels=8,
@@ -278,13 +331,35 @@ model:
         self.assertEqual(image.shape[2], 3)
 
     def test_extract_validation_sample_names_reads_appended_metadata(self):
-        self.assertEqual(
-            extract_validation_sample_names(tuple(range(9)) + (("a",),), use_f0=True),
-            ("a",),
+        batch = TrainingBatch(
+            phone=torch.zeros(1, 1, 1),
+            phone_lengths=torch.ones(1, dtype=torch.long),
+            pitch=None,
+            pitchf=None,
+            spec=torch.zeros(1, 1, 1),
+            spec_lengths=torch.ones(1, dtype=torch.long),
+            wave=torch.zeros(1, 1, 1),
+            wave_lengths=torch.ones(1, dtype=torch.long),
+            sid=torch.zeros(1, dtype=torch.long),
+            sample_names=("a",),
+        )
+        self.assertEqual(extract_validation_sample_names(batch), ("a",))
+
+    def test_extract_validation_sample_names_returns_none_when_missing(self):
+        batch = TrainingBatch(
+            phone=torch.zeros(1, 1, 1),
+            phone_lengths=torch.ones(1, dtype=torch.long),
+            pitch=None,
+            pitchf=None,
+            spec=torch.zeros(1, 1, 1),
+            spec_lengths=torch.ones(1, dtype=torch.long),
+            wave=torch.zeros(1, 1, 1),
+            wave_lengths=torch.ones(1, dtype=torch.long),
+            sid=torch.zeros(1, dtype=torch.long),
         )
         self.assertEqual(
-            extract_validation_sample_names(tuple(range(7)) + (("b",),), use_f0=False),
-            ("b",),
+            extract_validation_sample_names(batch),
+            None,
         )
 
     def test_reconstruct_full_returns_full_length_audio_for_f0_model(self):
@@ -320,6 +395,14 @@ model:
 
         self.assertEqual(tuple(audio.shape[:2]), (1, 1))
         self.assertEqual(audio.size(-1), 32)
+
+    def test_768_wrapper_reuses_shared_f0_core(self):
+        model = build_tiny_f0_model_768()
+        self.assertEqual(model.enc_p.emb_phone.in_features, 768)
+
+    def test_768_wrapper_reuses_shared_nof0_core(self):
+        model = build_tiny_nof0_model_768()
+        self.assertEqual(model.enc_p.emb_phone.in_features, 768)
 
 
 if __name__ == "__main__":

@@ -7,13 +7,16 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from configs.project_config import load_project_config, parse_hparams_overrides
-from src.preprocess.common import log_message, run_worker_shards
+from src.features.f0 import F0_METHODS
+from src.preprocess import audio as audio_stage
 from src.preprocess import f0 as f0_stage
-
+from src.preprocess import features as feature_stage
+from src.preprocess.common import log_message, run_worker_shards
+from src.preprocess.layout import MANIFEST_NAME, PreprocessLayout
+from src.rvc_profiles import get_feature_profile
 
 DEFAULT_STAGES = ("audio", "f0", "features", "filelist")
 VALID_STAGES = set(DEFAULT_STAGES)
-MANIFEST_NAME = "preprocess_manifest.jsonl"
 AUDIO_EXTENSIONS = {
     ".wav",
     ".mp3",
@@ -24,10 +27,6 @@ AUDIO_EXTENSIONS = {
     ".wma",
     ".opus",
 }
-F0_METHODS = {"pm", "harvest", "dio", "rmvpe"}
-FULL_FILELIST_NAME = "filelist.txt"
-TRAIN_FILELIST_NAME = "train_filelist.txt"
-VAL_FILELIST_NAME = "val_filelist.txt"
 
 
 @dataclass(frozen=True)
@@ -37,21 +36,25 @@ class DatasetItem:
     index: int
 
 
+def _layout_for_project(project: dict) -> PreprocessLayout:
+    return PreprocessLayout(
+        root=Path(project["paths"]["preprocess_dir"]),
+        feature_profile=get_feature_profile(str(project["selectors"]["version"])),
+    )
+
+
 def parse_stage_list(raw_stages: str | None) -> tuple[str, ...]:
     if raw_stages in (None, ""):
         return DEFAULT_STAGES
 
-    stages = tuple(
-        stage.strip().lower() for stage in raw_stages.split(",") if stage.strip()
-    )
+    stages = tuple(stage.strip().lower() for stage in raw_stages.split(",") if stage.strip())
     if not stages:
         raise ValueError("--stages cannot be empty")
 
     invalid = sorted(set(stages) - VALID_STAGES)
     if invalid:
         raise ValueError(
-            f"Unsupported stage(s): {', '.join(invalid)}. "
-            f"Expected any of: {', '.join(DEFAULT_STAGES)}"
+            f"Unsupported stage(s): {', '.join(invalid)}. Expected any of: {', '.join(DEFAULT_STAGES)}"
         )
     return tuple(dict.fromkeys(stages))
 
@@ -65,11 +68,7 @@ def _direct_audio_files(root: Path) -> list[Path]:
 
 
 def _visible_dirs(root: Path) -> list[Path]:
-    return sorted(
-        path
-        for path in root.iterdir()
-        if path.is_dir() and not path.name.startswith(".")
-    )
+    return sorted(path for path in root.iterdir() if path.is_dir() and not path.name.startswith("."))
 
 
 def _speaker_embed_dim(project: dict) -> int:
@@ -83,10 +82,7 @@ def _speaker_embed_dim(project: dict) -> int:
     return spk_embed_dim
 
 
-def discover_dataset_items(
-    dataset_dir: str | Path,
-    spk_embed_dim: int,
-) -> list[DatasetItem]:
+def discover_dataset_items(dataset_dir: str | Path, spk_embed_dim: int) -> list[DatasetItem]:
     root = Path(dataset_dir)
     if not root.is_dir():
         raise FileNotFoundError(f"dataset_dir does not exist or is not a directory: {root}")
@@ -94,9 +90,7 @@ def discover_dataset_items(
     top_level_files = _direct_audio_files(root)
     speaker_dirs = _visible_dirs(root)
     if top_level_files and speaker_dirs:
-        raise ValueError(
-            "dataset_dir cannot mix top-level audio files and speaker subdirectories"
-        )
+        raise ValueError("dataset_dir cannot mix top-level audio files and speaker subdirectories")
 
     if top_level_files:
         return [
@@ -119,8 +113,7 @@ def discover_dataset_items(
     max_speaker_id = max(speaker_id for speaker_id, _ in numbered_dirs)
     if max_speaker_id > spk_embed_dim:
         raise ValueError(
-            f"Max speaker directory id {max_speaker_id} exceeds "
-            f"model.spk_embed_dim={spk_embed_dim}"
+            f"Max speaker directory id {max_speaker_id} exceeds model.spk_embed_dim={spk_embed_dim}"
         )
 
     items: list[DatasetItem] = []
@@ -134,30 +127,9 @@ def discover_dataset_items(
                     index=len(items),
                 )
             )
-
     if not items:
         raise ValueError(f"No audio files found under speaker directories in: {root}")
     return items
-
-
-def _run_audio_items_worker(
-    item_payload: list[tuple[str, int]],
-    sampling_rate: int,
-    preprocess_dir: str,
-) -> None:
-    from src.preprocess.audio import AudioPreprocessor
-
-    worker = AudioPreprocessor(
-        sampling_rate,
-        preprocess_dir,
-        noparallel=True,
-    )
-    failures = 0
-    for source_path, item_index in item_payload:
-        if not worker.pipeline(source_path, item_index):
-            failures += 1
-    if failures:
-        raise RuntimeError(f"{failures} audio preprocessing item(s) failed")
 
 
 def _output_sort_key(path: Path) -> tuple[int, str]:
@@ -167,21 +139,11 @@ def _output_sort_key(path: Path) -> tuple[int, str]:
         return 0, path.name
 
 
-def _manifest_records(
-    items: list[DatasetItem],
-    preprocess_dir: str | Path,
-) -> list[dict]:
-    preprocess_path = Path(preprocess_dir)
-    gt_wavs_dir = preprocess_path / "0_gt_wavs"
-    wavs16k_dir = preprocess_path / "1_16k_wavs"
-
+def _manifest_records(items: list[DatasetItem], layout: PreprocessLayout) -> list[dict]:
     records: list[dict] = []
     for item in items:
-        for gt_wav in sorted(
-            gt_wavs_dir.glob(f"{item.index}_*.wav"),
-            key=_output_sort_key,
-        ):
-            wav16k = wavs16k_dir / gt_wav.name
+        for gt_wav in sorted(layout.gt_wavs_dir.glob(f"{item.index}_*.wav"), key=_output_sort_key):
+            wav16k = layout.wav16k_dir / gt_wav.name
             if not wav16k.is_file():
                 continue
             records.append(
@@ -195,20 +157,29 @@ def _manifest_records(
     return records
 
 
-def write_preprocess_manifest(
-    items: list[DatasetItem],
-    preprocess_dir: str | Path,
-) -> Path:
-    records = _manifest_records(items, preprocess_dir)
+def write_preprocess_manifest(items: list[DatasetItem], preprocess_dir: str | Path) -> Path:
+    layout = PreprocessLayout(Path(preprocess_dir), get_feature_profile("v1"))
+    layout.root.mkdir(parents=True, exist_ok=True)
+    records = _manifest_records(items, layout)
     if not records:
         raise RuntimeError("Audio preprocessing produced no manifest rows")
 
-    manifest_path = Path(preprocess_dir) / MANIFEST_NAME
     payload = "\n".join(json.dumps(record, ensure_ascii=False) for record in records)
-    manifest_path.write_text(f"{payload}\n", encoding="utf-8")
-    log_path = manifest_path.parent / "preprocess.log"
-    log_message(log_path, f"wrote manifest rows={len(records)}: {manifest_path}")
-    return manifest_path
+    layout.manifest_path.write_text(f"{payload}\n", encoding="utf-8")
+    log_message(layout.preprocess_log_path, f"wrote manifest rows={len(records)}: {layout.manifest_path}")
+    return layout.manifest_path
+
+
+def _write_project_manifest(items: list[DatasetItem], layout: PreprocessLayout) -> Path:
+    layout.root.mkdir(parents=True, exist_ok=True)
+    records = _manifest_records(items, layout)
+    if not records:
+        raise RuntimeError("Audio preprocessing produced no manifest rows")
+
+    payload = "\n".join(json.dumps(record, ensure_ascii=False) for record in records)
+    layout.manifest_path.write_text(f"{payload}\n", encoding="utf-8")
+    log_message(layout.preprocess_log_path, f"wrote manifest rows={len(records)}: {layout.manifest_path}")
+    return layout.manifest_path
 
 
 def load_preprocess_manifest(preprocess_dir: str | Path) -> list[dict]:
@@ -236,102 +207,24 @@ def load_preprocess_manifest(preprocess_dir: str | Path) -> list[dict]:
     return records
 
 
-def _sample_rate(project: dict) -> str:
-    return str(
-        project.get("sample_rate", project.get("selectors", {}).get("sample_rate", ""))
-    ).lower()
-
-
-def _legacy_gt_wav_for(wav16k: Path, gt_wavs_dir: Path, project: dict) -> Path | None:
-    same_name = gt_wavs_dir / wav16k.name
-    if same_name.is_file():
-        return same_name
-
-    same_stem = gt_wavs_dir / f"{wav16k.stem}.wav"
-    if same_stem.is_file():
-        return same_stem
-
-    sample_rate = _sample_rate(project)
-    if sample_rate:
-        sample_rate_match = gt_wavs_dir / f"{wav16k.stem}{sample_rate}.wav"
-        if sample_rate_match.is_file():
-            return sample_rate_match
-
-    gt_wavs = sorted(gt_wavs_dir.glob("*.wav"))
-    prefix_matches = [
-        path for path in gt_wavs if path.stem.lower().startswith(wav16k.stem.lower())
-    ]
-    if len(prefix_matches) == 1:
-        return prefix_matches[0]
-    if len(gt_wavs) == 1:
-        return gt_wavs[0]
-    return None
-
-
-def _legacy_manifest_records(project: dict, preprocess_dir: Path) -> list[dict]:
-    gt_wavs_dir = preprocess_dir / "0_gt_wavs"
-    wavs16k_dir = preprocess_dir / "1_16k_wavs"
-    records: list[dict] = []
-
-    for wav16k in sorted(wavs16k_dir.glob("*.wav")):
-        gt_wav = _legacy_gt_wav_for(wav16k, gt_wavs_dir, project)
-        if gt_wav is None:
-            continue
-        records.append(
-            {
-                "source_path": str(wav16k.resolve()),
-                "speaker_id": 0,
-                "gt_wav": str(gt_wav.resolve()),
-                "wav16k": str(wav16k.resolve()),
-            }
-        )
-
-    if not records:
-        raise FileNotFoundError(
-            f"Missing {preprocess_dir / MANIFEST_NAME} and no legacy single-speaker "
-            "audio pairs were found"
-        )
-
-    print(
-        f"warning: {MANIFEST_NAME} is missing; using legacy single-speaker "
-        f"filelist scan rows={len(records)}"
-    )
-    return records
-
-
 def _if_f0(project: dict) -> int:
-    return int(project.get("if_f0", project.get("selectors", {}).get("if_f0", 1)))
+    return int(project["selectors"]["if_f0"])
 
 
-def _version(project: dict) -> str:
-    return str(project.get("version", project.get("selectors", {}).get("version", "v2")))
-
-
-def _feature_dir(project: dict, preprocess_dir: Path) -> Path:
-    return preprocess_dir / (
-        "3_feature256" if _version(project) == "v1" else "3_feature768"
-    )
-
-
-def _build_filelist_rows(
-    project: dict,
-    records: list[dict],
-) -> tuple[list[str], int]:
-    preprocess_dir = Path(project["paths"]["preprocess_dir"])
-    feature_dir = _feature_dir(project, preprocess_dir)
+def _build_filelist_rows(project: dict, records: list[dict], layout: PreprocessLayout) -> tuple[list[str], int]:
     use_f0 = _if_f0(project) == 1
     rows: list[str] = []
     skipped = 0
     for record in records:
         gt_wav = Path(record["gt_wav"])
         wav16k = Path(record["wav16k"])
-        feature_path = feature_dir / wav16k.with_suffix(".npy").name
+        feature_path = layout.feature_dir / wav16k.with_suffix(".npy").name
         sid = int(record["speaker_id"])
 
         required_paths = [gt_wav, feature_path]
         if use_f0:
-            coarse_f0 = preprocess_dir / "2a_f0" / f"{wav16k.name}.npy"
-            nsf_f0 = preprocess_dir / "2b-f0nsf" / f"{wav16k.name}.npy"
+            coarse_f0 = layout.f0_dir / f"{wav16k.name}.npy"
+            nsf_f0 = layout.f0nsf_dir / f"{wav16k.name}.npy"
             required_paths.extend([coarse_f0, nsf_f0])
 
         if not all(path.is_file() for path in required_paths):
@@ -339,9 +232,7 @@ def _build_filelist_rows(
             continue
 
         if use_f0:
-            rows.append(
-                "|".join(map(str, [gt_wav, feature_path, coarse_f0, nsf_f0, sid]))
-            )
+            rows.append("|".join(map(str, [gt_wav, feature_path, coarse_f0, nsf_f0, sid])))
         else:
             rows.append("|".join(map(str, [gt_wav, feature_path, sid])))
 
@@ -369,9 +260,7 @@ def _resolve_validation_seed(project: dict) -> int:
     try:
         return int(value)
     except (TypeError, ValueError) as exc:
-        raise ValueError(
-            f"preprocess.validation_seed must be an integer, got: {value!r}"
-        ) from exc
+        raise ValueError(f"preprocess.validation_seed must be an integer, got: {value!r}") from exc
 
 
 def _speaker_sort_key(value: str) -> tuple[int, int | str]:
@@ -426,8 +315,7 @@ def split_filelist_rows(
             grouped_val_lines[best_sid].append(grouped_train_lines[best_sid].pop(0))
         else:
             raise RuntimeError(
-                "Validation split produced no validation samples. "
-                "Add more data or adjust preprocess.validation_split."
+                "Validation split produced no validation samples. Add more data or adjust preprocess.validation_split."
             )
 
     train_lines: list[str] = []
@@ -440,40 +328,28 @@ def split_filelist_rows(
 
 
 def generate_filelist(project: dict) -> tuple[Path, int, int]:
-    preprocess_dir = Path(project["paths"]["preprocess_dir"])
-    try:
-        records = load_preprocess_manifest(preprocess_dir)
-    except FileNotFoundError:
-        records = _legacy_manifest_records(project, preprocess_dir)
-
-    rows, skipped = _build_filelist_rows(project, records)
-
+    layout = _layout_for_project(project)
+    records = load_preprocess_manifest(layout.root)
+    rows, skipped = _build_filelist_rows(project, records, layout)
     if not rows:
         raise RuntimeError(
             "No valid preprocess samples found for filelist. "
             f"manifest_rows={len(records)}, skipped={skipped}"
         )
 
-    filelist_path = preprocess_dir / FULL_FILELIST_NAME
-    filelist_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
-    print(f"wrote filelist rows={len(rows)}, skipped={skipped}: {filelist_path}")
+    layout.filelist_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    log_message(layout.preprocess_log_path, f"wrote filelist rows={len(rows)}, skipped={skipped}: {layout.filelist_path}")
 
     train_lines, val_lines = split_filelist_rows(
         rows,
         _resolve_validation_split(project),
         _resolve_validation_seed(project),
     )
-    train_filelist_path = preprocess_dir / TRAIN_FILELIST_NAME
-    val_filelist_path = preprocess_dir / VAL_FILELIST_NAME
-    train_filelist_path.write_text(
-        "\n".join(train_lines) + "\n", encoding="utf-8"
-    )
-    val_filelist_path.write_text(
-        "\n".join(val_lines) + "\n", encoding="utf-8"
-    )
-    print(f"wrote train filelist rows={len(train_lines)}: {train_filelist_path}")
-    print(f"wrote val filelist rows={len(val_lines)}: {val_filelist_path}")
-    return filelist_path, len(rows), skipped
+    layout.train_filelist_path.write_text("\n".join(train_lines) + "\n", encoding="utf-8")
+    layout.val_filelist_path.write_text("\n".join(val_lines) + "\n", encoding="utf-8")
+    log_message(layout.preprocess_log_path, f"wrote train filelist rows={len(train_lines)}: {layout.train_filelist_path}")
+    log_message(layout.preprocess_log_path, f"wrote val filelist rows={len(val_lines)}: {layout.val_filelist_path}")
+    return layout.filelist_path, len(rows), skipped
 
 
 def _resolve_audio_workers(project: dict, workers_override: int | None) -> int:
@@ -481,47 +357,50 @@ def _resolve_audio_workers(project: dict, workers_override: int | None) -> int:
     return int(workers_override if workers_override is not None else runtime["n_cpu"])
 
 
-def _resolve_f0_workers(
-    project: dict,
-    f0method: str,
-    workers_override: int | None,
-) -> int:
+def _resolve_f0_workers(project: dict, f0method: str, workers_override: int | None) -> int:
     if workers_override is not None:
         return int(workers_override)
     return 1 if f0method == "rmvpe" else int(project["runtime"]["n_cpu"])
 
 
-def run_audio_stage(project: dict, workers_override: int | None = None) -> Path:
-    paths = project["paths"]
-    preprocess_dir = Path(paths["preprocess_dir"])
-    preprocess_dir.mkdir(parents=True, exist_ok=True)
+def _resolve_runtime_device(project: dict, device_override: str | None) -> str:
+    if device_override not in {None, "", "auto"}:
+        return str(device_override)
+    return str(project["runtime"]["device"])
 
-    items = discover_dataset_items(paths["dataset_dir"], _speaker_embed_dim(project))
+
+def _resolve_runtime_is_half(project: dict, is_half_override: bool | None) -> bool:
+    if is_half_override is not None:
+        return bool(is_half_override)
+    return bool(project["runtime"]["is_half"])
+
+
+def run_audio_stage(project: dict, workers_override: int | None = None) -> Path:
+    layout = _layout_for_project(project)
+    layout.root.mkdir(parents=True, exist_ok=True)
+
+    items = discover_dataset_items(project["paths"]["dataset_dir"], _speaker_embed_dim(project))
     sampling_rate = int(project["data"]["sampling_rate"])
     preprocess_config = project.get("preprocess", {})
     workers = min(_resolve_audio_workers(project, workers_override), len(items))
     workers = max(workers, 1)
     noparallel = bool(preprocess_config.get("noparallel", False))
-    log_path = preprocess_dir / "preprocess.log"
 
     log_message(
-        log_path,
-        f"start audio preprocess, items={len(items)}, workers={workers}, "
-        f"noparallel={noparallel}, mode=prepared-audio",
+        layout.preprocess_log_path,
+        f"start audio preprocess, items={len(items)}, workers={workers}, noparallel={noparallel}, mode=prepared-audio",
     )
-
     payload = [(str(item.source_path), item.index) for item in items]
     run_worker_shards(
         payload,
         workers,
-        _run_audio_items_worker,
-        lambda shard: (shard, sampling_rate, str(preprocess_dir)),
+        audio_stage.run_audio_items,
+        lambda shard: (shard, sampling_rate, layout.root),
         error_label="audio preprocess worker",
         parallel=not noparallel,
     )
-
-    manifest_path = write_preprocess_manifest(items, preprocess_dir)
-    log_message(log_path, "end audio preprocess")
+    manifest_path = _write_project_manifest(items, layout)
+    log_message(layout.preprocess_log_path, "end audio preprocess")
     return manifest_path
 
 
@@ -529,68 +408,59 @@ def run_f0_stage(
     project: dict,
     f0method: str,
     workers_override: int | None = None,
+    *,
+    device_override: str | None = None,
+    is_half_override: bool | None = None,
 ) -> None:
     if _if_f0(project) == 0:
-        print("skip f0 stage because selectors.if_f0=0")
+        log_message(_layout_for_project(project).feature_log_path, "skip f0 stage because selectors.if_f0=0")
         return
-
     if f0method not in F0_METHODS:
         raise ValueError(f"Unsupported f0method={f0method!r}")
 
-    paths_config = project["paths"]
-    exp_dir = Path(paths_config["preprocess_dir"])
-    exp_dir.mkdir(parents=True, exist_ok=True)
-    log_path = exp_dir / "extract_f0_feature.log"
+    layout = _layout_for_project(project)
+    layout.root.mkdir(parents=True, exist_ok=True)
     workers = _resolve_f0_workers(project, f0method, workers_override)
-    runtime = project["runtime"]
-
-    i_gpu = ""
-    device_request = str(runtime["device"])
-    if device_request.startswith("cuda:"):
-        i_gpu = device_request.split(":", 1)[1]
-
-    runtime_args = argparse.Namespace(
-        f0method=f0method,
-        i_gpu=i_gpu,
-        is_half=bool(runtime["is_half"]),
+    device_request = _resolve_runtime_device(project, device_override)
+    is_half_request = _resolve_runtime_is_half(project, is_half_override)
+    device, is_half = f0_stage.resolve_runtime(
+        f0method,
+        device_request,
+        is_half_request,
+        layout.feature_log_path,
     )
-    device, is_half, _ = f0_stage.resolve_runtime(runtime_args, log_path)
-    pretrain_root = str(paths_config["pretrain_root"])
-    paths = f0_stage.build_paths(exp_dir)
+    pretrain_root = str(project["paths"]["pretrain_root"])
+    paths = f0_stage.build_paths(layout)
 
     log_message(
-        log_path,
+        layout.feature_log_path,
         f"pipeline-f0,method={f0method},workers={workers},device={device},is_half={is_half}",
     )
     run_worker_shards(
         paths,
         workers,
         f0_stage.run_worker,
-        lambda shard: (shard, f0method, device, is_half, pretrain_root, log_path),
+        lambda shard: (shard, f0method, device, is_half, pretrain_root, layout.feature_log_path),
         error_label="f0 worker",
     )
 
 
-def run_feature_stage(project: dict) -> None:
-    from src.preprocess import features as feature_stage
-
-    paths = project["paths"]
-    exp_dir = Path(paths["preprocess_dir"])
-    exp_dir.mkdir(parents=True, exist_ok=True)
-    runtime = project["runtime"]
-    device_request = str(runtime["device"])
-    device = feature_stage.resolve_device(
-        device_request if device_request.startswith("cuda") else "cpu"
-    )
+def run_feature_stage(
+    project: dict,
+    *,
+    device_override: str | None = None,
+    is_half_override: bool | None = None,
+) -> None:
+    layout = _layout_for_project(project)
+    layout.root.mkdir(parents=True, exist_ok=True)
+    device = feature_stage.resolve_device(_resolve_runtime_device(project, device_override))
     feature_stage.extract_features(
-        exp_dir=exp_dir,
-        version=_version(project),
+        layout=layout,
         n_part=1,
         i_part=0,
         device=device,
-        is_half=bool(runtime["is_half"]),
-        model_path=str(paths["hubert_path"]),
-        log_path=exp_dir / "extract_f0_feature.log",
+        is_half=_resolve_runtime_is_half(project, is_half_override),
+        model_path=str(project["paths"]["hubert_path"]),
     )
 
 
@@ -599,26 +469,36 @@ def run_pipeline(
     stages: tuple[str, ...],
     f0method: str,
     workers_override: int | None = None,
+    *,
+    device_override: str | None = None,
+    is_half_override: bool | None = None,
 ) -> None:
     for stage in stages:
         if stage == "audio":
             run_audio_stage(project, workers_override)
         elif stage == "f0":
-            run_f0_stage(project, f0method, workers_override)
+            run_f0_stage(
+                project,
+                f0method,
+                workers_override,
+                device_override=device_override,
+                is_half_override=is_half_override,
+            )
         elif stage == "features":
-            run_feature_stage(project)
+            run_feature_stage(
+                project,
+                device_override=device_override,
+                is_half_override=is_half_override,
+            )
         elif stage == "filelist":
             generate_filelist(project)
-        else:  # pragma: no cover - parse_stage_list rejects this.
+        else:  # pragma: no cover
             raise ValueError(f"Unsupported stage: {stage}")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description=(
-            "Run the full RVC preprocessing pipeline: audio, F0, HuBERT features, "
-            "and filelist generation."
-        )
+        description="Run the unified RVC preprocessing pipeline."
     )
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--hparams", type=str, default="")
@@ -642,6 +522,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override audio and F0 worker counts. RMVPE defaults to 1 worker.",
     )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="Override runtime.device for F0 and feature stages. Default: config runtime.device",
+    )
+    parser.add_argument(
+        "--is-half",
+        dest="is_half",
+        action="store_true",
+        help="Force half precision where supported for F0 and feature stages.",
+    )
+    parser.set_defaults(is_half=None)
     return parser
 
 
@@ -661,15 +554,19 @@ def main(argv: list[str] | None = None) -> None:
         overrides=parse_hparams_overrides(args.hparams),
         reset=args.reset,
     )
-    f0method = (
-        args.f0method
-        or project.get("preprocess", {}).get("f0method")
-        or "rmvpe"
-    )
+    f0method = args.f0method or project.get("preprocess", {}).get("f0method") or "rmvpe"
     if f0method not in F0_METHODS:
-        parser.error("--f0method must be one of: pm, harvest, dio, rmvpe")
+        parser.error(f"--f0method must be one of: {', '.join(F0_METHODS)}")
 
-    run_pipeline(project, stages, f0method, args.workers)
+    device_override = None if args.device == "auto" else args.device
+    run_pipeline(
+        project,
+        stages,
+        f0method,
+        args.workers,
+        device_override=device_override,
+        is_half_override=args.is_half,
+    )
 
 
 if __name__ == "__main__":

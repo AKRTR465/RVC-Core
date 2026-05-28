@@ -2,7 +2,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from src.index import __main__ as index_main
+import numpy as np
+
+from src.index import cli as index_cli
+from src.index.common import SOURCE_MATRIX_NAME, load_source_matrix, save_source_matrix
+from src.index.retrieval import load_retrieval_index
 from tests.equivalence_helpers import make_temp_dir, patched_argv
 
 
@@ -50,7 +54,7 @@ class IndexCliTest(unittest.TestCase):
                 "configs.project_config._detect_runtime_environment",
                 return_value=fake_runtime_profile(),
             ):
-                request = index_main.parse_args()
+                request = index_cli.parse_args()
 
         self.assertEqual(request.feature_dim, 256)
         self.assertIsNone(request.n_cpu)
@@ -72,7 +76,7 @@ class IndexCliTest(unittest.TestCase):
                 "configs.project_config._detect_runtime_environment",
                 return_value=fake_runtime_profile(),
             ):
-                request = index_main.parse_args()
+                request = index_cli.parse_args()
 
         self.assertEqual(request.feature_dim, 768)
         self.assertEqual(request.n_cpu, 3)
@@ -95,7 +99,7 @@ class IndexCliTest(unittest.TestCase):
                 "4",
             ]
         ):
-            request = index_main.parse_args()
+            request = index_cli.parse_args()
 
         self.assertEqual(request.inp_root, Path("features"))
         self.assertEqual(request.output, Path("artifacts/demo.index"))
@@ -105,12 +109,35 @@ class IndexCliTest(unittest.TestCase):
 
     def test_main_builds_with_parsed_request(self):
         request = object()
-        with mock.patch("src.index.__main__.parse_args", return_value=request), mock.patch(
-            "src.index.__main__.build_index"
+        with mock.patch("src.index.cli.parse_args", return_value=request), mock.patch(
+            "src.index.cli.build_index"
         ) as build_index:
-            index_main.main()
+            index_cli.main()
 
         build_index.assert_called_once_with(request)
+
+    def test_source_matrix_contract_is_shared(self):
+        with make_temp_dir() as tmp:
+            index_dir = Path(tmp)
+            matrix = np.ones((2, 3), dtype=np.float32)
+            save_source_matrix(index_dir, matrix)
+
+            loaded = load_source_matrix(index_dir, feature_dim=3)
+            self.assertTrue((index_dir / SOURCE_MATRIX_NAME).is_file())
+
+        np.testing.assert_array_equal(loaded, matrix)
+
+    def test_load_retrieval_index_uses_shared_source_matrix_loader(self):
+        fake_index = mock.Mock(ntotal=2, d=3)
+        with make_temp_dir() as tmp:
+            index_path = Path(tmp) / "demo.index"
+            index_path.write_bytes(b"idx")
+            save_source_matrix(index_path.parent, np.ones((2, 3), dtype=np.float32))
+            with mock.patch("faiss.read_index", return_value=fake_index):
+                index, source = load_retrieval_index(index_path)
+
+        self.assertIs(index, fake_index)
+        self.assertEqual(tuple(source.shape), (2, 3))
 
 
 if __name__ == "__main__":

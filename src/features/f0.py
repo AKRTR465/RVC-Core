@@ -5,6 +5,7 @@ import numpy as np
 F0_MIN = 50.0
 F0_MAX = 1100.0
 F0_BIN = 256
+F0_METHODS = ("pm", "harvest", "dio", "rmvpe", "crepe")
 
 
 def compute_pm_f0(x, sr, p_len, f0_min=F0_MIN, f0_max=F0_MAX, hop_size=160):
@@ -99,6 +100,8 @@ def compute_f0_by_method(
     f0_min=F0_MIN,
     f0_max=F0_MAX,
 ):
+    if method not in F0_METHODS:
+        raise ValueError(f"Unsupported f0 method: {method}")
     if method == "pm":
         return (
             compute_pm_f0(x, sr, p_len, f0_min=f0_min, f0_max=f0_max, hop_size=hop_size),
@@ -124,7 +127,6 @@ def compute_f0_by_method(
                 log_fn,
             )
         return model.infer_from_audio(x, thred=0.03), model
-    raise ValueError(f"Unsupported f0 method: {method}")
 
 
 def f0_to_coarse(f0, f0_min=F0_MIN, f0_max=F0_MAX, f0_bin=F0_BIN):

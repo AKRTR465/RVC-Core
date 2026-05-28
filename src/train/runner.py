@@ -34,6 +34,7 @@ from src.train.data_utils import (
     TextAudioCollateMultiNSFsid,
     TextAudioLoader,
     TextAudioLoaderMultiNSFsid,
+    TrainingBatch,
 )
 
 from src.models.models import (
@@ -53,10 +54,10 @@ from src.train.losses import (
 )
 from src.train import mel_processing
 from src.train.checkpoint_export import savee
+from src.train.checkpoints import model_state_dict as checkpoint_model_state_dict
 from src.train.deterministic_gpu import (
-    apply_deterministic_gpu_patches,
-    reset_backend_runtime_overrides,
     reset_deterministic_caches,
+    resolve_runtime_backend,
 )
 
 global_step = 0
@@ -178,6 +179,10 @@ def _strict_repro_mode(hps) -> bool:
     return _numeric_backend(hps) == "deterministic_gpu"
 
 
+def _runtime_backend(hps):
+    return resolve_runtime_backend(_numeric_backend(hps), mel_processing)
+
+
 def _step_seed(base_seed: int, epoch: int, batch_idx: int) -> int:
     return int(base_seed) + int(epoch) * 100000 + int(batch_idx)
 
@@ -227,9 +232,9 @@ def configure_torch_runtime(runtime) -> None:
         torch.use_deterministic_algorithms(True)
 
 
-def _compute_y_hat_mel(hps, y_hat, amp_device_type):
+def _compute_y_hat_mel(hps, runtime_backend, y_hat, amp_device_type):
     with amp.autocast(amp_device_type, enabled=False):
-        return mel_processing.mel_spectrogram_torch(
+        return runtime_backend.mel_spectrogram_torch(
             y_hat.float().squeeze(1),
             hps.data.filter_length,
             hps.data.n_mel_channels,
@@ -355,6 +360,10 @@ def _unwrap_model(model):
     return model.module if hasattr(model, "module") else model
 
 
+def _batch_uses_f0(batch: TrainingBatch) -> bool:
+    return batch.pitch is not None and batch.pitchf is not None
+
+
 def trim_audio_to_length(audio, length):
     return audio[..., : int(length)]
 
@@ -383,55 +392,106 @@ def build_ddsp_validation_image_dict(sample_name, gt_mel, pred_mel):
     }
 
 
-def extract_validation_sample_names(info, use_f0):
-    expected_items = 9 if use_f0 else 7
-    if len(info) > expected_items:
-        extra = info[expected_items]
-        if isinstance(extra, (tuple, list)) and all(
-            isinstance(name, str) for name in extra
-        ):
-            return extra
-    return None
+def extract_validation_sample_names(batch: TrainingBatch):
+    return batch.sample_names
 
 
 def infer_full_validation_audio(
     raw_g,
-    use_f0,
-    phone,
-    phone_lengths,
-    pitch,
-    pitchf,
-    sid,
-    spec_lengths,
+    batch: TrainingBatch,
 ):
-    if use_f0:
+    if _batch_uses_f0(batch):
         audio, _, _ = raw_g.infer(
-            phone,
-            phone_lengths,
-            pitch,
-            pitchf,
-            sid,
-            return_length2=spec_lengths,
+            batch.phone,
+            batch.phone_lengths,
+            batch.pitch,
+            batch.pitchf,
+            batch.sid,
+            return_length2=batch.spec_lengths,
         )
     else:
         audio, _, _ = raw_g.infer(
-            phone,
-            phone_lengths,
-            sid,
-            return_length2=spec_lengths,
+            batch.phone,
+            batch.phone_lengths,
+            batch.sid,
+            return_length2=batch.spec_lengths,
         )
     return audio
 
 
-def validate(epoch, hps, nets, val_loader, writer, logger, global_step, amp_device_type):
+def _forward_generator_batch(model, batch: TrainingBatch, *, validation: bool):
+    if _batch_uses_f0(batch):
+        if validation:
+            return model.forward_val(
+                batch.phone,
+                batch.phone_lengths,
+                batch.pitch,
+                batch.pitchf,
+                batch.spec,
+                batch.spec_lengths,
+                batch.sid,
+            )
+        return model(
+            batch.phone,
+            batch.phone_lengths,
+            batch.pitch,
+            batch.pitchf,
+            batch.spec,
+            batch.spec_lengths,
+            batch.sid,
+        )
+    if validation:
+        return model.forward_val(
+            batch.phone,
+            batch.phone_lengths,
+            batch.spec,
+            batch.spec_lengths,
+            batch.sid,
+        )
+    return model(
+        batch.phone,
+        batch.phone_lengths,
+        batch.spec,
+        batch.spec_lengths,
+        batch.sid,
+    )
+
+
+def _build_segment_targets(hps, runtime_backend, batch: TrainingBatch, ids_slice, y_hat, amp_device_type):
+    mel = runtime_backend.spec_to_mel_torch(
+        batch.spec,
+        hps.data.filter_length,
+        hps.data.n_mel_channels,
+        hps.data.sampling_rate,
+        hps.data.mel_fmin,
+        hps.data.mel_fmax,
+    )
+    y_mel = commons.slice_segments(
+        mel, ids_slice, hps.train.segment_size // hps.data.hop_length
+    )
+    y_hat_mel = _compute_y_hat_mel(hps, runtime_backend, y_hat, amp_device_type)
+    wave_slice = commons.slice_segments(
+        batch.wave, ids_slice * hps.data.hop_length, hps.train.segment_size
+    )
+    return mel, y_mel, y_hat_mel, wave_slice
+
+
+def validate(
+    epoch,
+    hps,
+    nets,
+    val_loader,
+    writer,
+    logger,
+    global_step,
+    amp_device_type,
+    runtime_backend,
+):
     net_g, net_d = nets
     net_g.eval()
     net_d.eval()
     if _strict_repro_mode(hps):
         reset_deterministic_caches()
-
-    use_f0 = hps.if_f0 == 1
-    segment_size_frames = hps.train.segment_size // hps.data.hop_length
 
     loss_disc_sum = 0.0
     loss_gen_sum = 0.0
@@ -445,15 +505,11 @@ def validate(epoch, hps, nets, val_loader, writer, logger, global_step, amp_devi
     raw_d = _unwrap_model(net_d)
 
     with torch.no_grad():
-        for batch_idx, info in enumerate(val_loader):
+        for batch_idx, batch in enumerate(val_loader):
             if _strict_repro_mode(hps):
                 _seed_torch_for_step(_step_seed(hps.train.seed, epoch, batch_idx))
-            info = move_batch_to_device(info, 0, use_f0, include_wave_lengths=False)
-            sample_names = extract_validation_sample_names(info, use_f0)
-            (
-                phone, phone_lengths, pitch, pitchf,
-                spec, spec_lengths, wave, wave_lengths, sid,
-            ) = unpack_training_batch(info, use_f0)
+            batch = move_batch_to_device(batch, 0)
+            sample_names = extract_validation_sample_names(batch)
             sample_name = (
                 sample_names[0]
                 if sample_names is not None and len(sample_names) > 0
@@ -461,36 +517,21 @@ def validate(epoch, hps, nets, val_loader, writer, logger, global_step, amp_devi
             )
 
             with amp.autocast(amp_device_type, enabled=hps.train.fp16_run):
-                if use_f0:
-                    (
-                        y_hat, ids_slice, x_mask, z_mask,
-                        (z, z_p, m_p, logs_p, m_q, logs_q),
-                    ) = raw_g.forward_val(
-                        phone, phone_lengths, pitch, pitchf,
-                        spec, spec_lengths, sid,
-                    )
-                else:
-                    (
-                        y_hat, ids_slice, x_mask, z_mask,
-                        (z, z_p, m_p, logs_p, m_q, logs_q),
-                    ) = raw_g.forward_val(
-                        phone, phone_lengths, spec, spec_lengths, sid,
-                    )
+                (
+                    y_hat,
+                    ids_slice,
+                    x_mask,
+                    z_mask,
+                    (z, z_p, m_p, logs_p, m_q, logs_q),
+                ) = _forward_generator_batch(raw_g, batch, validation=True)
 
-                mel = mel_processing.spec_to_mel_torch(
-                    spec,
-                    hps.data.filter_length,
-                    hps.data.n_mel_channels,
-                    hps.data.sampling_rate,
-                    hps.data.mel_fmin,
-                    hps.data.mel_fmax,
-                )
-                y_mel = commons.slice_segments(
-                    mel, ids_slice, segment_size_frames
-                )
-                y_hat_mel = _compute_y_hat_mel(hps, y_hat, amp_device_type)
-                wave_slice = commons.slice_segments(
-                    wave, ids_slice * hps.data.hop_length, hps.train.segment_size
+                mel, y_mel, y_hat_mel, wave_slice = _build_segment_targets(
+                    hps,
+                    runtime_backend,
+                    batch,
+                    ids_slice,
+                    y_hat,
+                    amp_device_type,
                 )
 
                 y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = raw_d(wave_slice, y_hat)
@@ -501,26 +542,17 @@ def validate(epoch, hps, nets, val_loader, writer, logger, global_step, amp_devi
                     loss_fm = feature_loss(fmap_r, fmap_g)
                     loss_gen, _ = generator_loss(y_d_hat_g)
                     loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl
-                full_pred_audio = infer_full_validation_audio(
-                    raw_g,
-                    use_f0,
-                    phone,
-                    phone_lengths,
-                    pitch,
-                    pitchf,
-                    sid,
-                    spec_lengths,
-                )
+                full_pred_audio = infer_full_validation_audio(raw_g, batch)
                 full_pred_audio = full_pred_audio.float()
-                full_gt_audio = wave[0, 0].float()
-                target_wave_length = int(wave_lengths[0].item())
+                full_gt_audio = batch.wave[0, 0].float()
+                target_wave_length = int(batch.wave_lengths[0].item())
                 compare_wave_length = min(target_wave_length, int(full_pred_audio.size(-1)))
                 full_gt_audio = trim_audio_to_length(full_gt_audio, compare_wave_length)
                 full_pred_audio = trim_audio_to_length(
                     full_pred_audio[0, 0],
                     compare_wave_length,
                 )
-                full_gt_mel = mel_processing.mel_spectrogram_torch(
+                full_gt_mel = runtime_backend.mel_spectrogram_torch(
                     full_gt_audio.unsqueeze(0),
                     hps.data.filter_length,
                     hps.data.n_mel_channels,
@@ -530,7 +562,7 @@ def validate(epoch, hps, nets, val_loader, writer, logger, global_step, amp_devi
                     hps.data.mel_fmin,
                     hps.data.mel_fmax,
                 )[0]
-                full_pred_mel = mel_processing.mel_spectrogram_torch(
+                full_pred_mel = runtime_backend.mel_spectrogram_torch(
                     full_pred_audio.unsqueeze(0),
                     hps.data.filter_length,
                     hps.data.n_mel_channels,
@@ -614,17 +646,14 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
         )
     RVC_Model_f0, RVC_Model_nof0, Discriminator = resolve_model_classes(hps.version)
     writer = None
-    applied_runtime = []
     try:
         configure_torch_runtime(hps.runtime)
-        reset_backend_runtime_overrides()
         reset_deterministic_caches()
-        applied_runtime = apply_deterministic_gpu_patches(hps)
+        runtime_backend = _runtime_backend(hps)
         if rank == 0:
             logger.info(hps)
             writer = SummaryWriter(log_dir=hps.model_dir)
-            if applied_runtime:
-                logger.info("applied runtime overrides: %s", applied_runtime)
+            logger.info("using runtime backend: %s", runtime_backend.name)
 
         if use_distributed:
             dist.init_process_group(
@@ -639,9 +668,19 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
         val_filelist_path = hps.data.validation_files
 
         if hps.if_f0 == 1:
-            train_dataset = TextAudioLoaderMultiNSFsid(training_files, hps.data)
+            train_dataset = TextAudioLoaderMultiNSFsid(
+                training_files,
+                hps.data,
+                spectrogram_fn=runtime_backend.spectrogram_torch,
+                spectrogram_cache_tag=runtime_backend.name,
+            )
         else:
-            train_dataset = TextAudioLoader(training_files, hps.data)
+            train_dataset = TextAudioLoader(
+                training_files,
+                hps.data,
+                spectrogram_fn=runtime_backend.spectrogram_torch,
+                spectrogram_cache_tag=runtime_backend.name,
+            )
         train_sampler = DistributedBucketSampler(
             train_dataset,
             hps.train.batch_size,
@@ -675,6 +714,8 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
                 val_dataset = TextAudioLoaderMultiNSFsid(
                     val_filelist_path,
                     hps.data,
+                    spectrogram_fn=runtime_backend.spectrogram_torch,
+                    spectrogram_cache_tag=runtime_backend.name,
                     return_sample_name=True,
                     filelist_label="f0 validation",
                 )
@@ -683,6 +724,8 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
                 val_dataset = TextAudioLoader(
                     val_filelist_path,
                     hps.data,
+                    spectrogram_fn=runtime_backend.spectrogram_torch,
+                    spectrogram_cache_tag=runtime_backend.name,
                     return_sample_name=True,
                     filelist_label="validation",
                 )
@@ -703,6 +746,7 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
                 **hps.model,
                 is_half=hps.train.fp16_run,
                 sr=hps.sample_rate,
+                numeric_backend=runtime_backend.name,
             )
         else:
             net_g = RVC_Model_nof0(
@@ -710,10 +754,14 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
                 hps.train.segment_size // hps.data.hop_length,
                 **hps.model,
                 is_half=hps.train.fp16_run,
+                numeric_backend=runtime_backend.name,
             )
         if torch.cuda.is_available():
             net_g = net_g.cuda(rank)
-        net_d = Discriminator(hps.model.use_spectral_norm)
+        net_d = Discriminator(
+            hps.model.use_spectral_norm,
+            deterministic_pad=runtime_backend.deterministic_discriminator_pad,
+        )
         if torch.cuda.is_available():
             net_d = net_d.cuda(rank)
         optim_g = torch.optim.AdamW(
@@ -822,6 +870,7 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
                     writer,
                     cache,
                     amp_device_type,
+                    runtime_backend,
                 )
             else:
                 train_and_evaluate(
@@ -836,16 +885,16 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
                     None,
                     cache,
                     amp_device_type,
+                    runtime_backend,
                 )
             if rank == 0 and epoch % hps.save_every_epoch == 0:
                 validate(
                     epoch, hps, [net_g, net_d], val_loader,
-                    writer, logger, global_step, amp_device_type,
+                    writer, logger, global_step, amp_device_type, runtime_backend,
                 )
             scheduler_g.step()
             scheduler_d.step()
     finally:
-        reset_backend_runtime_overrides()
         reset_deterministic_caches()
         if writer is not None:
             writer.flush()
@@ -854,51 +903,46 @@ def run(rank, n_gpus, hps, logger: logging.Logger):
             dist.destroy_process_group()
 
 
-def move_batch_to_device(info, rank, use_f0, include_wave_lengths):
+def _cuda_if_tensor(value, rank):
+    if value is None or not torch.cuda.is_available():
+        return value
+    if isinstance(value, torch.Tensor):
+        return value.cuda(rank, non_blocking=True)
+    return value
+
+
+def move_batch_to_device(batch: TrainingBatch, rank):
     if not torch.cuda.is_available():
-        return info
-
-    values = list(info)
-    if use_f0:
-        cuda_indices = [0, 1, 2, 3, 4, 5, 6, 8]
-        if include_wave_lengths:
-            cuda_indices.append(7)
-    else:
-        cuda_indices = [0, 1, 2, 3, 4, 6]
-        if include_wave_lengths:
-            cuda_indices.append(5)
-
-    for index in cuda_indices:
-        values[index] = values[index].cuda(rank, non_blocking=True)
-    return tuple(values)
+        return batch
+    return batch._replace(
+        phone=_cuda_if_tensor(batch.phone, rank),
+        phone_lengths=_cuda_if_tensor(batch.phone_lengths, rank),
+        pitch=_cuda_if_tensor(batch.pitch, rank),
+        pitchf=_cuda_if_tensor(batch.pitchf, rank),
+        spec=_cuda_if_tensor(batch.spec, rank),
+        spec_lengths=_cuda_if_tensor(batch.spec_lengths, rank),
+        wave=_cuda_if_tensor(batch.wave, rank),
+        wave_lengths=_cuda_if_tensor(batch.wave_lengths, rank),
+        sid=_cuda_if_tensor(batch.sid, rank),
+        ids_sorted_decreasing=_cuda_if_tensor(batch.ids_sorted_decreasing, rank),
+    )
 
 
 def prepare_epoch_iterator(train_loader, cache, rank, hps):
     if not hps.if_cache_data_in_gpu:
         return enumerate(train_loader)
 
-    use_f0 = hps.if_f0 == 1
     if not cache:
-        for batch_idx, info in enumerate(train_loader):
+        for batch_idx, batch in enumerate(train_loader):
             cache.append(
                 (
                     batch_idx,
-                    move_batch_to_device(
-                        info, rank, use_f0, include_wave_lengths=True
-                    ),
+                    move_batch_to_device(batch, rank),
                 )
             )
     else:
         shuffle(cache)
     return cache
-
-
-def unpack_training_batch(info, use_f0):
-    if use_f0:
-        return info[:9]
-
-    phone, phone_lengths, spec, spec_lengths, wave, wave_lengths, sid = info[:7]
-    return phone, phone_lengths, None, None, spec, spec_lengths, wave, wave_lengths, sid
 
 
 def train_and_evaluate(
@@ -913,6 +957,7 @@ def train_and_evaluate(
     writer,
     cache,
     amp_device_type,
+    runtime_backend,
 ):
     net_g, net_d = nets
     optim_g, optim_d = optims
@@ -924,7 +969,6 @@ def train_and_evaluate(
     net_g.train()
     net_d.train()
 
-    use_f0 = hps.if_f0 == 1
     data_iterator = prepare_epoch_iterator(train_loader, cache, rank, hps)
     progress = tqdm(
         total=len(train_loader),
@@ -938,61 +982,32 @@ def train_and_evaluate(
     # Run steps
     epoch_recorder = EpochRecorder()
     try:
-        for batch_idx, info in data_iterator:
+        for batch_idx, batch in data_iterator:
             if strict_mode:
                 _seed_torch_for_step(_step_seed(hps.train.seed, epoch, batch_idx))
             if not hps.if_cache_data_in_gpu:
-                info = move_batch_to_device(
-                    info, rank, use_f0, include_wave_lengths=False
-                )
-            (
-                phone,
-                phone_lengths,
-                pitch,
-                pitchf,
-                spec,
-                spec_lengths,
-                wave,
-                wave_lengths,
-                sid,
-            ) = unpack_training_batch(info, use_f0)
+                batch = move_batch_to_device(batch, rank)
 
             # Calculate
             with amp.autocast(amp_device_type, enabled=hps.train.fp16_run):
-                if use_f0:
-                    (
-                        y_hat,
-                        ids_slice,
-                        x_mask,
-                        z_mask,
-                        (z, z_p, m_p, logs_p, m_q, logs_q),
-                    ) = net_g(phone, phone_lengths, pitch, pitchf, spec, spec_lengths, sid)
-                else:
-                    (
-                        y_hat,
-                        ids_slice,
-                        x_mask,
-                        z_mask,
-                        (z, z_p, m_p, logs_p, m_q, logs_q),
-                    ) = net_g(phone, phone_lengths, spec, spec_lengths, sid)
-                mel = mel_processing.spec_to_mel_torch(
-                    spec,
-                    hps.data.filter_length,
-                    hps.data.n_mel_channels,
-                    hps.data.sampling_rate,
-                    hps.data.mel_fmin,
-                    hps.data.mel_fmax,
+                (
+                    y_hat,
+                    ids_slice,
+                    x_mask,
+                    z_mask,
+                    (z, z_p, m_p, logs_p, m_q, logs_q),
+                ) = _forward_generator_batch(net_g, batch, validation=False)
+                mel, y_mel, y_hat_mel, wave_slice = _build_segment_targets(
+                    hps,
+                    runtime_backend,
+                    batch,
+                    ids_slice,
+                    y_hat,
+                    amp_device_type,
                 )
-                y_mel = commons.slice_segments(
-                    mel, ids_slice, hps.train.segment_size // hps.data.hop_length
-                )
-                y_hat_mel = _compute_y_hat_mel(hps, y_hat, amp_device_type)
-                wave = commons.slice_segments(
-                    wave, ids_slice * hps.data.hop_length, hps.train.segment_size
-                )  # slice
 
                 # Discriminator
-                y_d_hat_r, y_d_hat_g, _, _ = net_d(wave, y_hat.detach())
+                y_d_hat_r, y_d_hat_g, _, _ = net_d(wave_slice, y_hat.detach())
                 with amp.autocast(amp_device_type, enabled=False):
                     loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(
                         y_d_hat_r, y_d_hat_g
@@ -1008,7 +1023,7 @@ def train_and_evaluate(
 
             with amp.autocast(amp_device_type, enabled=hps.train.fp16_run):
                 # Generator
-                y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(wave, y_hat)
+                y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(wave_slice, y_hat)
                 with amp.autocast(amp_device_type, enabled=False):
                     loss_mel = _compute_loss_mel(y_mel, y_hat_mel, hps)
                     loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
@@ -1115,10 +1130,6 @@ def train_and_evaluate(
         return
 
 
-def model_state_dict(model):
-    return model.module.state_dict() if hasattr(model, "module") else model.state_dict()
-
-
 def save_epoch_checkpoints(
     rank, epoch, hps, net_g, net_d, optim_g, optim_d, scaler, logger, step
 ):
@@ -1148,7 +1159,7 @@ def save_epoch_checkpoints(
             hps.name,
             epoch,
             savee(
-                model_state_dict(net_g),
+                checkpoint_model_state_dict(net_g),
                 hps.sample_rate,
                 hps.if_f0,
                 hps.name + "_e%s_s%s" % (epoch, step),
@@ -1167,7 +1178,7 @@ def save_final_checkpoint(rank, epoch, hps, net_g, logger):
         logger.info(
             "saving final ckpt:%s",
             savee(
-                model_state_dict(net_g),
+                checkpoint_model_state_dict(net_g),
                 hps.sample_rate,
                 hps.if_f0,
                 hps.name,
@@ -1178,7 +1189,7 @@ def save_final_checkpoint(rank, epoch, hps, net_g, logger):
         )
     else:
         savee(
-            model_state_dict(net_g),
+            checkpoint_model_state_dict(net_g),
             hps.sample_rate,
             hps.if_f0,
             hps.name,

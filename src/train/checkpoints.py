@@ -19,6 +19,10 @@ def _model_state_dict(model):
     return model.state_dict()
 
 
+def model_state_dict(model):
+    return _model_state_dict(model)
+
+
 def _load_matching_state_dict(model, saved_state_dict, mismatch_message):
     state_dict = _model_state_dict(model)
     new_state_dict = {}

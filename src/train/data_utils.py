@@ -1,6 +1,7 @@
 import os
 import pickle
 import logging
+from typing import Callable, NamedTuple
 
 logger = logging.getLogger(__name__)
 
@@ -9,7 +10,7 @@ import torch
 from torch.utils.data import Dataset
 from torch.utils.data.distributed import DistributedSampler
 
-from src.train.mel_processing import spectrogram_torch
+from src.train import mel_processing
 from src.train.utils import load_filepaths_and_text, load_wav_to_torch
 
 
@@ -23,6 +24,20 @@ def save_tensor_atomic(tensor, filename):
             os.remove(tmp_filename)
 
 
+class TrainingBatch(NamedTuple):
+    phone: torch.Tensor
+    phone_lengths: torch.Tensor
+    pitch: torch.Tensor | None
+    pitchf: torch.Tensor | None
+    spec: torch.Tensor
+    spec_lengths: torch.Tensor
+    wave: torch.Tensor
+    wave_lengths: torch.Tensor
+    sid: torch.Tensor
+    sample_names: tuple[str, ...] | None = None
+    ids_sorted_decreasing: torch.Tensor | None = None
+
+
 class _TextAudioLoaderBase(Dataset):
     has_f0 = False
     expected_columns = 3
@@ -32,10 +47,14 @@ class _TextAudioLoaderBase(Dataset):
         self,
         audiopaths_and_text,
         hparams,
+        spectrogram_fn: Callable | None = None,
+        spectrogram_cache_tag: str = "native",
         return_sample_name=False,
         filelist_label=None,
     ):
         self.audiopaths_and_text = load_filepaths_and_text(audiopaths_and_text)
+        self.spectrogram_fn = spectrogram_fn or mel_processing.spectrogram_torch
+        self.spectrogram_cache_tag = str(spectrogram_cache_tag)
         self.return_sample_name = bool(return_sample_name)
         if filelist_label is not None:
             self.filelist_label = filelist_label
@@ -135,7 +154,7 @@ class _TextAudioLoaderBase(Dataset):
         return spec, audio_norm
 
     def compute_spec(self, audio_norm):
-        spec = spectrogram_torch(
+        spec = self.spectrogram_fn(
             audio_norm,
             self.filter_length,
             self.sampling_rate,
@@ -147,9 +166,10 @@ class _TextAudioLoaderBase(Dataset):
 
     def get_spec_filename(self, filename):
         stem, _ = os.path.splitext(filename)
+        backend_tag = f".backend{self.spectrogram_cache_tag}"
         return (
             f"{stem}.sr{self.sampling_rate}.fft{self.filter_length}"
-            f".hop{self.hop_length}.win{self.win_length}.spec.pt"
+            f".hop{self.hop_length}.win{self.win_length}{backend_tag}.spec.pt"
         )
 
     def __getitem__(self, index):
@@ -220,34 +240,19 @@ class _TextAudioCollateBase:
                 if self.return_sample_names:
                     sample_names.append(row[4])
 
-        if self.has_f0:
-            result = (
-                phone_padded,
-                phone_lengths,
-                pitch_padded,
-                pitchf_padded,
-                spec_padded,
-                spec_lengths,
-                wave_padded,
-                wave_lengths,
-                sid,
-            )
-        else:
-            result = (
-                phone_padded,
-                phone_lengths,
-                spec_padded,
-                spec_lengths,
-                wave_padded,
-                wave_lengths,
-                sid,
-            )
-        extras = []
-        if self.return_sample_names:
-            extras.append(tuple(sample_names))
-        if self.return_ids:
-            extras.append(ids_sorted_decreasing)
-        return result + tuple(extras) if extras else result
+        return TrainingBatch(
+            phone=phone_padded,
+            phone_lengths=phone_lengths,
+            pitch=pitch_padded if self.has_f0 else None,
+            pitchf=pitchf_padded if self.has_f0 else None,
+            spec=spec_padded,
+            spec_lengths=spec_lengths,
+            wave=wave_padded,
+            wave_lengths=wave_lengths,
+            sid=sid,
+            sample_names=tuple(sample_names) if self.return_sample_names else None,
+            ids_sorted_decreasing=ids_sorted_decreasing if self.return_ids else None,
+        )
 
 
 class TextAudioCollateMultiNSFsid(_TextAudioCollateBase):

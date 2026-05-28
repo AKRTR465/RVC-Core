@@ -6,7 +6,12 @@ import torch
 from torch import amp
 
 from configs.project_config import load_project_config
-from src.train.deterministic_gpu import reflect_pad_last, spectrogram_torch
+from src.train.deterministic_gpu import (
+    reflect_pad_last,
+    resolve_runtime_backend,
+    spectrogram_torch,
+)
+from src.train import mel_processing
 from src.train import utils as train_utils
 from tests.equivalence_helpers import make_temp_dir
 
@@ -126,6 +131,13 @@ class DeterministicGpuHelperTest(unittest.TestCase):
 
         self.assertEqual(tuple(spec.shape), (1, 3, 6))
         self.assertTrue(torch.isfinite(spec).all().item())
+
+    def test_resolve_runtime_backend_selects_deterministic_flags(self):
+        backend = resolve_runtime_backend("deterministic_gpu", mel_processing)
+
+        self.assertEqual(backend.name, "deterministic_gpu")
+        self.assertTrue(backend.deterministic_sine)
+        self.assertTrue(backend.deterministic_discriminator_pad)
 
     def test_checkpoint_round_trip_restores_grad_scaler_state(self):
         with make_temp_dir() as tmp:

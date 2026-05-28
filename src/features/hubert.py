@@ -78,11 +78,11 @@ def extract_hubert_features(
         return model.final_proj(logits[0]) if version == "v1" else logits[0]
 
 
-def read_wave_16k(wav_path, soundfile_module, normalize=False):
+def read_wave_16k(wav_path, soundfile_module):
     wav, sr = soundfile_module.read(wav_path)
     if sr != 16000:
         raise ValueError(f"{wav_path} sampling rate must be 16000, got {sr}")
-    return prepare_hubert_waveform(wav, normalize=normalize, source_label=str(wav_path))
+    return wav
 
 
 def load_hubert_model(model_path, device, is_half, log_fn=None):

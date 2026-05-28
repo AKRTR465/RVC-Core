@@ -1,135 +1,102 @@
 import io
 import unittest
 from contextlib import redirect_stderr
-from pathlib import Path
 from unittest import mock
 
-from src.preprocess import audio as audio_stage
-from src.preprocess import f0 as f0_stage
-from src.preprocess import features as feature_stage
+from src.preprocess import pipeline as preprocess_pipeline
 from tests.equivalence_helpers import patched_argv
 
 
 class PreprocessCliArgsTest(unittest.TestCase):
-    def assert_parse_error(self, fn, argv, pattern):
+    def assert_parse_error(self, argv, pattern):
         stderr = io.StringIO()
         with (
-            patched_argv(argv),
             redirect_stderr(stderr),
             self.assertRaises(SystemExit) as exc,
         ):
-            fn()
+            preprocess_pipeline.main(argv)
         self.assertEqual(exc.exception.code, 2)
         self.assertRegex(stderr.getvalue(), pattern)
 
-    def test_audio_parse_args_accepts_config_mode(self):
+    def test_main_accepts_config_mode_and_crepe_override(self):
         project = {
             "paths": {
                 "dataset_dir": "data/dataset",
                 "preprocess_dir": "data/preprocess",
+                "pretrain_root": "pretrain",
+                "hubert_path": "pretrain/hubert/hubert_base.pt",
             },
             "data": {"sampling_rate": 48000},
-            "runtime": {"n_cpu": 6},
-            "preprocess": {"noparallel": True},
+            "runtime": {"n_cpu": 6, "device": "cpu", "is_half": False},
+            "model": {"spk_embed_dim": 1},
+            "selectors": {"version": "v2", "if_f0": 1},
+            "preprocess": {"noparallel": True, "f0method": "rmvpe"},
         }
-        with (
-            patched_argv(["audio", "--config", "project.yaml"]),
-            mock.patch("src.preprocess.audio.load_project_config", return_value=project),
-        ):
-            args = audio_stage.parse_args()
+        with mock.patch(
+            "src.preprocess.pipeline.load_project_config",
+            return_value=project,
+        ), mock.patch("src.preprocess.pipeline.run_pipeline") as run_pipeline:
+            preprocess_pipeline.main(
+                [
+                    "--config",
+                    "project.yaml",
+                    "--f0method",
+                    "crepe",
+                    "--workers",
+                    "3",
+                    "--device",
+                    "cpu",
+                ]
+            )
 
-        self.assertEqual(
-            args,
-            ("data/dataset", 48000, 6, "data/preprocess", True),
+        run_pipeline.assert_called_once_with(
+            project,
+            preprocess_pipeline.DEFAULT_STAGES,
+            "crepe",
+            3,
+            device_override="cpu",
+            is_half_override=None,
         )
 
-    def test_audio_parse_args_accepts_named_manual_mode(self):
-        with patched_argv(
-            [
-                "audio",
-                "--inp_root",
-                "data/raw",
-                "--preprocess_dir",
-                "data/preprocess",
-                "--sample-rate",
-                "48000",
-                "--n_p",
-                "3",
-                "--noparallel",
-            ]
-        ):
-            args = audio_stage.parse_args()
-
-        self.assertEqual(
-            args,
-            ("data/raw", 48000, 3, "data/preprocess", True),
-        )
-
-    def test_audio_parse_args_rejects_removed_positional_mode(self):
-        self.assert_parse_error(
-            audio_stage.parse_args,
-            ["audio", "data/raw", "48000", "3", "data/preprocess", "True"],
-            r"unrecognized arguments:",
-        )
-
-    def test_f0_parse_args_accepts_config_mode(self):
-        project = {
-            "paths": {"preprocess_dir": "data/preprocess"},
-            "preprocess": {"f0method": "harvest"},
-            "runtime": {
-                "device": "cpu",
-                "is_half": True,
-                "n_cpu": 4,
-            },
-        }
-        with (
-            patched_argv(["f0", "--config", "project.yaml"]),
-            mock.patch("src.preprocess.f0.load_project_config", return_value=project),
-        ):
-            args = f0_stage.parse_args()
-
-        self.assertEqual(args.exp_dir, "data/preprocess")
-        self.assertEqual(args.f0method, "harvest")
-        self.assertEqual(args.workers, 4)
-        self.assertEqual(args.i_gpu, "")
-        self.assertTrue(args.is_half)
-
-    def test_f0_parse_args_rejects_removed_positional_mode(self):
-        self.assert_parse_error(
-            f0_stage.parse_args,
-            ["f0", "data/preprocess", "4", "rmvpe"],
-            r"unrecognized arguments:",
-        )
-
-    def test_features_parse_args_accepts_config_mode(self):
+    def test_main_allows_is_half_override(self):
         project = {
             "paths": {
+                "dataset_dir": "data/dataset",
                 "preprocess_dir": "data/preprocess",
                 "pretrain_root": "pretrain",
+                "hubert_path": "pretrain/hubert/hubert_base.pt",
             },
-            "selectors": {"version": "v2"},
-            "runtime": {
-                "device": "cpu",
-                "is_half": False,
-            },
+            "data": {"sampling_rate": 48000},
+            "runtime": {"n_cpu": 6, "device": "cuda:0", "is_half": False},
+            "model": {"spk_embed_dim": 1},
+            "selectors": {"version": "v2", "if_f0": 1},
+            "preprocess": {"noparallel": True, "f0method": "rmvpe"},
         }
-        with (
-            patched_argv(["features", "--config", "project.yaml"]),
-            mock.patch("src.preprocess.features.load_project_config", return_value=project),
-        ):
-            args = feature_stage.parse_args()
+        with mock.patch(
+            "src.preprocess.pipeline.load_project_config",
+            return_value=project,
+        ), mock.patch("src.preprocess.pipeline.run_pipeline") as run_pipeline:
+            preprocess_pipeline.main(["--config", "project.yaml", "--is-half"])
 
-        self.assertEqual(args.exp_dir, "data/preprocess")
-        self.assertEqual(args.version, "v2")
-        self.assertEqual(args.device, "cpu")
-        self.assertFalse(args.is_half)
-        self.assertEqual(args.model_path, str(Path("pretrain") / "hubert" / "hubert_base.pt"))
+        run_pipeline.assert_called_once_with(
+            project,
+            preprocess_pipeline.DEFAULT_STAGES,
+            "rmvpe",
+            None,
+            device_override=None,
+            is_half_override=True,
+        )
 
-    def test_features_parse_args_rejects_removed_positional_mode(self):
+    def test_main_rejects_invalid_stage_list(self):
         self.assert_parse_error(
-            feature_stage.parse_args,
-            ["features", "cpu", "1", "0", "data/preprocess", "v1", "True"],
-            r"unrecognized arguments:",
+            ["--config", "project.yaml", "--stages", "audio,unknown"],
+            r"Unsupported stage\(s\): unknown",
+        )
+
+    def test_main_rejects_invalid_workers(self):
+        self.assert_parse_error(
+            ["--config", "project.yaml", "--workers", "0"],
+            r"--workers must be >= 1",
         )
 
 

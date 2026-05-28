@@ -1,11 +1,24 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import torch
+from src.features.mel import build_mel_basis
 from torch import amp
 from torch.nn import functional as F
+
+
+@dataclass(frozen=True)
+class RuntimeBackend:
+    name: str
+    spectrogram_torch: Callable
+    spec_to_mel_torch: Callable
+    mel_spectrogram_torch: Callable
+    deterministic_sine: bool = False
+    deterministic_discriminator_pad: bool = False
 
 
 _MEL_BASIS_CACHE: dict[tuple[Any, ...], torch.Tensor] = {}
@@ -21,88 +34,25 @@ def reset_deterministic_caches() -> None:
     _PREFIX_SUM_CACHE.clear()
 
 
-def _patch_attr(target: Any, name: str, value: Any) -> None:
-    original_name = f"_rvc_rebuild_original_{name}"
-    if not hasattr(target, original_name):
-        setattr(target, original_name, getattr(target, name))
-    setattr(target, name, value)
-
-
-def _restore_attr(target: Any, name: str) -> None:
-    original_name = f"_rvc_rebuild_original_{name}"
-    if hasattr(target, original_name):
-        setattr(target, name, getattr(target, original_name))
-
-
-def reset_backend_runtime_overrides() -> None:
-    from src.models import models as models_module
-    from src.train import data_utils, mel_processing
-
-    for name in ("spectrogram_torch", "spec_to_mel_torch", "mel_spectrogram_torch"):
-        _restore_attr(mel_processing, name)
-    _restore_attr(data_utils, "spectrogram_torch")
-    _restore_attr(models_module.SineGen, "_f02sine")
-    _restore_attr(models_module.DiscriminatorP, "forward")
-
-
-def _hz_to_mel(frequencies, htk: bool = False):
-    frequencies = np.asanyarray(frequencies, dtype=np.float64)
-    if htk:
-        return 2595.0 * np.log10(1.0 + frequencies / 700.0)
-
-    f_sp = 200.0 / 3.0
-    mels = frequencies.copy()
-    mels /= f_sp
-    min_log_hz = 1000.0
-    min_log_mel = min_log_hz / f_sp
-    logstep = np.log(6.4) / 27.0
-    log_t = frequencies >= min_log_hz
-    mels[log_t] = min_log_mel + np.log(frequencies[log_t] / min_log_hz) / logstep
-    return mels
-
-
-def _mel_to_hz(mels, htk: bool = False):
-    mels = np.asanyarray(mels, dtype=np.float64)
-    if htk:
-        return 700.0 * (10.0 ** (mels / 2595.0) - 1.0)
-
-    f_sp = 200.0 / 3.0
-    freqs = mels.copy()
-    freqs *= f_sp
-    min_log_hz = 1000.0
-    min_log_mel = min_log_hz / f_sp
-    logstep = np.log(6.4) / 27.0
-    log_t = mels >= min_log_mel
-    freqs[log_t] = min_log_hz * np.exp(logstep * (mels[log_t] - min_log_mel))
-    return freqs
-
-
-def _mel_frequencies(n_mels: int, fmin: float, fmax: float, htk: bool = False):
-    min_mel = _hz_to_mel(fmin, htk=htk)
-    max_mel = _hz_to_mel(fmax, htk=htk)
-    return _mel_to_hz(np.linspace(min_mel, max_mel, n_mels), htk=htk)
-
-
-def _build_mel_basis(
-    sampling_rate: int,
-    n_fft: int,
-    num_mels: int,
-    fmin: float,
-    fmax: float | None,
-) -> np.ndarray:
-    if fmax is None:
-        fmax = float(sampling_rate) / 2.0
-    fftfreqs = np.fft.rfftfreq(n=n_fft, d=1.0 / sampling_rate)
-    mel_f = _mel_frequencies(num_mels + 2, fmin, fmax, htk=False)
-    fdiff = np.diff(mel_f)
-    ramps = np.subtract.outer(mel_f, fftfreqs)
-
-    lower = -ramps[:-2] / fdiff[:-1, np.newaxis]
-    upper = ramps[2:] / fdiff[1:, np.newaxis]
-    weights = np.maximum(0.0, np.minimum(lower, upper))
-    enorm = 2.0 / (mel_f[2 : num_mels + 2] - mel_f[:num_mels])
-    weights *= enorm[:, np.newaxis]
-    return weights.astype(np.float32, copy=False)
+def resolve_runtime_backend(mode: str, native_module) -> RuntimeBackend:
+    resolved_mode = str(mode).strip().lower()
+    if resolved_mode == "native":
+        return RuntimeBackend(
+            name="native",
+            spectrogram_torch=native_module.spectrogram_torch,
+            spec_to_mel_torch=native_module.spec_to_mel_torch,
+            mel_spectrogram_torch=native_module.mel_spectrogram_torch,
+        )
+    if resolved_mode == "deterministic_gpu":
+        return RuntimeBackend(
+            name="deterministic_gpu",
+            spectrogram_torch=spectrogram_torch,
+            spec_to_mel_torch=spec_to_mel_torch,
+            mel_spectrogram_torch=mel_spectrogram_torch,
+            deterministic_sine=True,
+            deterministic_discriminator_pad=True,
+        )
+    raise ValueError(f"Unsupported numeric backend: {mode!r}")
 
 
 def _autocast_device_type(device: torch.device) -> str:
@@ -156,7 +106,7 @@ def _mel_basis(
 ) -> torch.Tensor:
     key = (n_fft, num_mels, sampling_rate, fmin, fmax, device.type, device.index)
     if key not in _MEL_BASIS_CACHE:
-        basis = _build_mel_basis(sampling_rate, n_fft, num_mels, fmin, fmax)
+        basis = build_mel_basis(sampling_rate, n_fft, num_mels, fmin, fmax)
         _MEL_BASIS_CACHE[key] = torch.from_numpy(basis).to(device=device, dtype=torch.float32)
     return _MEL_BASIS_CACHE[key]
 
@@ -247,56 +197,3 @@ def deterministic_f02sine(self, f0: torch.Tensor, upp: int) -> torch.Tensor:
     rand_ini[..., 0] = 0
     rad = rad + rand_ini
     return torch.sin(2 * np.pi * rad)
-
-
-def build_discriminator_p_forward(models_module):
-    lrelu_slope = float(models_module.modules.LRELU_SLOPE)
-
-    def deterministic_forward(self, x: torch.Tensor):
-        fmap = []
-
-        batch_size, channels, total_length = x.shape
-        if total_length % self.period != 0:
-            n_pad = self.period - (total_length % self.period)
-            x = reflect_pad_last(x, 0, n_pad)
-            total_length = total_length + n_pad
-        x = x.view(batch_size, channels, total_length // self.period, self.period)
-
-        for layer in self.convs:
-            x = layer(x)
-            x = F.leaky_relu(x, lrelu_slope)
-            fmap.append(x)
-        x = self.conv_post(x)
-        fmap.append(x)
-        x = torch.flatten(x, 1, -1)
-        return x, fmap
-
-    return deterministic_forward
-
-
-def apply_deterministic_gpu_patches(hps) -> list[str]:
-    mode = str(
-        getattr(hps.train, "numeric_backend", getattr(hps.train, "mel_loss_device", "native"))
-    ).strip().lower()
-    if mode != "deterministic_gpu":
-        return []
-
-    from src.models import models as models_module
-    from src.train import data_utils, mel_processing
-
-    _patch_attr(mel_processing, "spectrogram_torch", spectrogram_torch)
-    _patch_attr(mel_processing, "spec_to_mel_torch", spec_to_mel_torch)
-    _patch_attr(mel_processing, "mel_spectrogram_torch", mel_spectrogram_torch)
-    _patch_attr(data_utils, "spectrogram_torch", spectrogram_torch)
-    _patch_attr(models_module.SineGen, "_f02sine", deterministic_f02sine)
-    _patch_attr(
-        models_module.DiscriminatorP,
-        "forward",
-        build_discriminator_p_forward(models_module),
-    )
-    return [
-        "deterministic_gpu_spec",
-        "deterministic_gpu_mel",
-        "deterministic_gpu_sine",
-        "deterministic_gpu_discriminator_pad",
-    ]
