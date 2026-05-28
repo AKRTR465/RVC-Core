@@ -291,13 +291,6 @@ python -m src.train --config configs/mute.yaml --reset
 python -m src.index --config configs/mute.yaml
 ```
 
-也可以直接指定版本入口：
-
-```bash
-python -m src.index.build_v1 --config configs/mute.yaml
-python -m src.index.build_v2 --config configs/mute.yaml --hparams selectors.version=v2,selectors.sample_rate=48k
-```
-
 输出：
 
 ```text
@@ -376,5 +369,5 @@ python -m src.train --config configs/mute.yaml -g 0-1 -bs 4
 - 新入口使用 `python -m src...`。
 - 旧 `infer/` 源树不再作为入口。
 - 模型 canonical 实现在 `src/models/`。
-- 旧 `infer_pack` 兼容导入只保留在 `src/utils/infer_pack/` wrapper。
+- 索引构建统一走 `python -m src.index`，不再保留 `build_v1/build_v2` 版本化入口。
 - 文档、源码和测试统一使用 UTF-8 无 BOM。

@@ -2,7 +2,7 @@ import argparse
 import logging
 import os
 import sys
-from multiprocessing import Process, cpu_count
+from multiprocessing import cpu_count
 from pathlib import Path
 
 import numpy as np
@@ -12,20 +12,12 @@ from src.features.f0 import (
     F0_BIN,
     F0_MAX,
     F0_MIN,
-    compute_pm_f0,
-    compute_world_f0,
+    compute_f0_by_method,
     f0_to_coarse,
-    load_rmvpe_model,
 )
+from src.preprocess.common import log_message, run_worker_shards
 
 logging.getLogger("numba").setLevel(logging.WARNING)
-
-
-def log_message(log_path, message):
-    print(message)
-    with open(log_path, "a+", encoding="utf-8") as handle:
-        handle.write(f"{message}\n")
-        handle.flush()
 
 
 def detect_cuda_profile():
@@ -87,21 +79,20 @@ class FeatureInput:
 
         x = load_audio(path, self.fs)
         p_len = x.shape[0] // self.hop
-        if f0_method == "pm":
-            f0 = compute_pm_f0(x, self.fs, p_len, self.f0_min, self.f0_max, self.hop)
-        elif f0_method in {"harvest", "dio"}:
-            f0 = compute_world_f0(x, self.fs, self.hop, f0_method, self.f0_min, self.f0_max)
-        elif f0_method == "rmvpe":
-            if hasattr(self, "model_rmvpe") is False:
-                self.model_rmvpe = load_rmvpe_model(
-                    os.path.join(self.pretrain_root, "rmvpe", "rmvpe.pt"),
-                    self.device,
-                    self.is_half,
-                    print,
-                )
-            f0 = self.model_rmvpe.infer_from_audio(x, thred=0.03)
-        else:
-            raise ValueError(f"Unsupported f0 method: {f0_method}")
+        f0, self.model_rmvpe = compute_f0_by_method(
+            x,
+            self.fs,
+            p_len,
+            self.hop,
+            f0_method,
+            device=self.device,
+            is_half=self.is_half,
+            pretrain_root=self.pretrain_root,
+            rmvpe_model=getattr(self, "model_rmvpe", None),
+            log_fn=print,
+            f0_min=self.f0_min,
+            f0_max=self.f0_max,
+        )
         return f0
 
     def coarse_f0(self, f0):
@@ -141,9 +132,6 @@ class FeatureInput:
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("legacy_exp_dir", nargs="?")
-    parser.add_argument("legacy_workers", nargs="?")
-    parser.add_argument("legacy_f0method", nargs="?")
     parser.add_argument("--config", type=str, default="")
     parser.add_argument("--hparams", type=str, default="")
     parser.add_argument("--reset", action="store_true")
@@ -161,52 +149,32 @@ def parse_args():
     parser.add_argument("--is-half", action="store_true", default=None)
     args = parser.parse_args()
 
-    legacy_values = [
-        args.legacy_exp_dir,
-        args.legacy_workers,
-        args.legacy_f0method,
-    ]
-    if any(value is not None for value in legacy_values):
-        if any(
-            [
-                args.config,
-                args.exp_dir,
-                args.f0method,
-                args.workers is not None,
-                args.is_half is not None,
-            ]
-        ):
-            parser.error("legacy mode cannot be mixed with --exp-dir/--f0method/--workers")
-        if None in legacy_values:
-            parser.error("legacy mode requires: exp_dir workers f0method")
-        args.exp_dir = args.legacy_exp_dir
-        args.workers = int(args.legacy_workers)
-        args.f0method = args.legacy_f0method
-
     if args.config:
-        if any(value is not None for value in legacy_values) or args.exp_dir:
-            parser.error("config mode cannot be mixed with legacy args or --exp-dir")
+        if args.exp_dir:
+            parser.error("config mode cannot be mixed with --exp-dir")
         project = load_project_config(
             args.config,
             overrides=parse_hparams_overrides(args.hparams),
             reset=args.reset,
         )
-        args.exp_dir = project["preprocess_dir"]
+        paths = project["paths"]
+        runtime = project["runtime"]
+        args.exp_dir = paths["preprocess_dir"]
         args.f0method = (
             args.f0method
             or project.get("preprocess", {}).get("f0method")
             or "rmvpe"
         )
-        device = str(project["device"])
+        device = str(runtime["device"])
         if device.startswith("cuda:") and args.i_gpu == "":
             args.i_gpu = device.split(":", 1)[1]
         if args.is_half is None:
-            args.is_half = bool(project["is_half"])
+            args.is_half = bool(runtime["is_half"])
         if args.workers is None:
-            args.workers = 1 if args.f0method == "rmvpe" else int(project["n_cpu"])
+            args.workers = 1 if args.f0method == "rmvpe" else int(runtime["n_cpu"])
 
     if args.exp_dir == "" or args.f0method == "":
-        parser.error("provide legacy args or --exp-dir and --f0method")
+        parser.error("provide --config or both --exp-dir and --f0method")
     if args.f0method not in {"pm", "harvest", "dio", "rmvpe"}:
         parser.error("--f0method must be one of: pm, harvest, dio, rmvpe")
 
@@ -318,31 +286,13 @@ def main():
         log_path,
         f"mode=workers,workers={args.workers},device={device},is_half={is_half}",
     )
-    if args.workers == 1:
-        run_worker(paths, args.f0method, device, is_half, pretrain_root, log_path)
-        return
-
-    ps = []
-    for i in range(args.workers):
-        process = Process(
-            target=run_worker,
-            args=(
-                paths[i:: args.workers],
-                args.f0method,
-                device,
-                is_half,
-                pretrain_root,
-                log_path,
-            ),
-        )
-        ps.append(process)
-        process.start()
-    for process in ps:
-        process.join()
-        if process.exitcode != 0:
-            raise RuntimeError(
-                f"f0 worker {process.pid} exited with code {process.exitcode}"
-            )
+    run_worker_shards(
+        paths,
+        args.workers,
+        run_worker,
+        lambda shard: (shard, args.f0method, device, is_half, pretrain_root, log_path),
+        error_label="f0 worker",
+    )
 
 
 if __name__ == "__main__":

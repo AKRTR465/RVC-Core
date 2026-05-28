@@ -62,7 +62,7 @@ train:
         self.assertTrue(config["runtime"]["disable_tf32"])
         self.assertEqual(config["runtime"]["cublas_workspace_config"], ":4096:8")
 
-    def test_load_project_config_accepts_legacy_mel_loss_device_alias(self):
+    def test_load_project_config_rejects_removed_mel_loss_device_alias(self):
         with make_temp_dir() as tmp:
             tmp_path = Path(tmp)
             config_path = tmp_path / "project.yaml"
@@ -76,22 +76,13 @@ train:
 """,
             )
 
-            with mock.patch(
-                "configs.project_config._detect_runtime_environment",
-                return_value={
-                    "device": "cuda:0",
-                    "device_request": "cuda:0",
-                    "gpu_name": "Mock GPU",
-                    "gpu_mem_gb": 8,
-                    "supports_half": True,
-                },
+            with self.assertRaisesRegex(
+                ValueError,
+                r"Unsupported train key 'mel_loss_device'.*train\.numeric_backend",
             ):
-                config = load_project_config(config_path, reset=True)
+                load_project_config(config_path, reset=True)
 
-        self.assertEqual(config["train"]["numeric_backend"], "deterministic_gpu")
-        self.assertNotIn("mel_loss_device", config["train"])
-
-    def test_load_project_config_rejects_equal_test_cpu_alias(self):
+    def test_load_project_config_rejects_numeric_backend_cpu_value(self):
         with make_temp_dir() as tmp:
             tmp_path = Path(tmp)
             config_path = tmp_path / "project.yaml"
@@ -101,11 +92,14 @@ train:
                 work_dir,
                 extra="""
 train:
-  mel_loss_device: cpu
+  numeric_backend: cpu
 """,
             )
 
-            with self.assertRaisesRegex(ValueError, "equal-test alignment runs"):
+            with self.assertRaisesRegex(
+                ValueError,
+                r"train\.numeric_backend must be native\|deterministic_gpu",
+            ):
                 load_project_config(config_path, reset=True)
 
 

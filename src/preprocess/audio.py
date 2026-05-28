@@ -1,5 +1,4 @@
 import argparse
-import multiprocessing
 import os
 from pathlib import Path
 
@@ -9,6 +8,7 @@ import numpy as np
 from scipy.io import wavfile
 
 from configs.project_config import load_project_config, parse_hparams_overrides
+from src.preprocess.common import log_message, run_worker_shards
 
 LOG_HANDLE = None
 
@@ -21,14 +21,7 @@ def init_log(preprocess_dir):
 
 
 def println(message, log_path=None):
-    print(message)
-    if LOG_HANDLE is not None:
-        LOG_HANDLE.write(f"{message}\n")
-        LOG_HANDLE.flush()
-    elif log_path is not None:
-        with open(log_path, "a+", encoding="utf-8") as handle:
-            handle.write(f"{message}\n")
-            handle.flush()
+    log_message(log_path, message, handle=LOG_HANDLE)
 
 
 class AudioPreprocessor:
@@ -115,23 +108,14 @@ class AudioPreprocessor:
                     sorted(path for path in Path(inp_root).iterdir() if path.is_file())
                 )
             ]
-            if self.noparallel:
-                for i in range(n_p):
-                    self.pipeline_mp(infos[i::n_p])
-            else:
-                ps = []
-                for i in range(n_p):
-                    process = multiprocessing.Process(
-                        target=self.pipeline_mp, args=(infos[i::n_p],)
-                    )
-                    ps.append(process)
-                    process.start()
-                for process in ps:
-                    process.join()
-                    if process.exitcode != 0:
-                        raise RuntimeError(
-                            f"preprocess worker {process.pid} exited with {process.exitcode}"
-                        )
+            run_worker_shards(
+                infos,
+                n_p,
+                self.pipeline_mp,
+                lambda shard: (shard,),
+                error_label="preprocess worker",
+                parallel=not self.noparallel,
+            )
         except (OSError, RuntimeError, ValueError) as exc:
             println(f"Fail. {type(exc).__name__}: {exc}", self.log_path)
             raise
@@ -156,11 +140,6 @@ PreProcess = AudioPreprocessor
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("legacy_inp_root", nargs="?")
-    parser.add_argument("legacy_sr", nargs="?")
-    parser.add_argument("legacy_n_p", nargs="?")
-    parser.add_argument("legacy_preprocess_dir", nargs="?")
-    parser.add_argument("legacy_noparallel", nargs="?")
     parser.add_argument("--config", type=str, default="")
     parser.add_argument("--hparams", type=str, default="")
     parser.add_argument("--reset", action="store_true")
@@ -174,11 +153,6 @@ def parse_args():
     if args.config:
         if any(
             [
-                args.legacy_inp_root,
-                args.legacy_sr,
-                args.legacy_n_p,
-                args.legacy_preprocess_dir,
-                args.legacy_noparallel,
                 args.inp_root,
                 args.preprocess_dir,
                 args.sample_rate is not None,
@@ -192,11 +166,13 @@ def parse_args():
             overrides=parse_hparams_overrides(args.hparams),
             reset=args.reset,
         )
+        paths = project["paths"]
+        runtime = project["runtime"]
         return (
-            project["dataset_dir"],
+            paths["dataset_dir"],
             int(project["data"]["sampling_rate"]),
-            int(project["n_cpu"]),
-            project["preprocess_dir"],
+            int(runtime["n_cpu"]),
+            paths["preprocess_dir"],
             bool(project["preprocess"]["noparallel"]),
         )
 
@@ -206,6 +182,7 @@ def parse_args():
             args.preprocess_dir,
             args.sample_rate is not None,
             args.n_p is not None,
+            args.noparallel,
         ]
     ):
         if args.inp_root == "" or args.preprocess_dir == "" or args.sample_rate is None:
@@ -222,26 +199,8 @@ def parse_args():
             bool(args.noparallel),
         )
 
-    if None in {
-        args.legacy_inp_root,
-        args.legacy_sr,
-        args.legacy_n_p,
-        args.legacy_preprocess_dir,
-        args.legacy_noparallel,
-    }:
-        parser.error(
-            "legacy mode requires: inp_root sr n_p preprocess_dir noparallel"
-        )
-
-    if int(args.legacy_n_p) < 1:
-        parser.error("legacy n_p must be >= 1")
-
-    return (
-        args.legacy_inp_root,
-        int(args.legacy_sr),
-        int(args.legacy_n_p),
-        args.legacy_preprocess_dir,
-        args.legacy_noparallel == "True",
+    parser.error(
+        "provide --config or manual options --inp_root --preprocess_dir --sample-rate --n_p"
     )
 
 

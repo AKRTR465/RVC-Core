@@ -26,9 +26,13 @@ def project_for(
     validation_seed=1234,
 ):
     return {
-        "preprocess_dir": str(preprocess_dir),
-        "version": version,
-        "if_f0": if_f0,
+        "paths": {
+            "preprocess_dir": str(preprocess_dir),
+        },
+        "selectors": {
+            "version": version,
+            "if_f0": if_f0,
+        },
         "preprocess": {
             "validation_split": validation_split,
             "validation_seed": validation_seed,

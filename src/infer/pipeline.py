@@ -13,12 +13,10 @@ from scipy import signal
 from src.features.f0 import (
     F0_MAX,
     F0_MIN,
-    compute_crepe_f0,
-    compute_pm_f0,
-    compute_world_f0,
+    compute_f0_by_method,
     f0_to_coarse,
-    load_rmvpe_model,
 )
+from src.features.hubert import extract_hubert_features
 from src.index.retrieval import blend_search_features, load_retrieval_index
 
 bh, ah = signal.butter(N=5, Wn=48, btype="high", fs=16000)
@@ -82,25 +80,22 @@ class Pipeline:
         filter_radius,
         inp_f0=None,
     ):
-        if f0_method == "pm":
-            f0 = compute_pm_f0(x, self.sr, p_len, F0_MIN, F0_MAX, self.window)
-        elif f0_method == "harvest":
-            f0 = compute_world_f0(x, self.sr, self.window, "harvest", F0_MIN, F0_MAX)
-            if filter_radius > 2:
-                f0 = signal.medfilt(f0, 3)
-        elif f0_method == "crepe":
-            f0 = compute_crepe_f0(x, self.sr, self.window, self.device, F0_MIN, F0_MAX)
-        elif f0_method == "rmvpe":
-            if not hasattr(self, "model_rmvpe"):
-                self.model_rmvpe = load_rmvpe_model(
-                    self.rmvpe_path,
-                    self.device,
-                    self.is_half,
-                    logger.info,
-                )
-            f0 = self.model_rmvpe.infer_from_audio(x, thred=0.03)
-        else:
-            raise ValueError(f"Unsupported f0 method: {f0_method}")
+        f0, self.model_rmvpe = compute_f0_by_method(
+            x,
+            self.sr,
+            p_len,
+            self.window,
+            f0_method,
+            device=self.device,
+            is_half=self.is_half,
+            rmvpe_path=self.rmvpe_path,
+            rmvpe_model=getattr(self, "model_rmvpe", None),
+            log_fn=logger.info,
+            f0_min=F0_MIN,
+            f0_max=F0_MAX,
+        )
+        if f0_method == "harvest" and filter_radius > 2:
+            f0 = signal.medfilt(f0, 3)
 
         f0 = f0.astype(np.float64, copy=True)
         f0 *= pow(2, f0_up_key / 12)
@@ -135,29 +130,15 @@ class Pipeline:
         version,
         protect,
     ):
-        feats = torch.from_numpy(audio0)
-        if self.is_half:
-            feats = feats.half()
-        else:
-            feats = feats.float()
-        if feats.dim() == 2:  # double channels
-            feats = feats.mean(-1)
-        if feats.dim() != 1:
-            raise ValueError(f"Expected mono audio tensor, got dim={feats.dim()}")
-        if getattr(model, "task_normalize", False):
-            feats = F.layer_norm(feats, feats.shape)
-        feats = feats.view(1, -1)
-        padding_mask = torch.BoolTensor(feats.shape).to(self.device).fill_(False)
-
-        inputs = {
-            "source": feats.to(self.device),
-            "padding_mask": padding_mask,
-            "output_layer": 9 if version == "v1" else 12,
-        }
         t0 = ttime()
-        with torch.no_grad():
-            logits = model.extract_features(**inputs)
-            feats = model.final_proj(logits[0]) if version == "v1" else logits[0]
+        feats = extract_hubert_features(
+            model,
+            audio0,
+            version,
+            self.device,
+            self.is_half,
+            mono_error_template="Expected mono audio tensor, got dim={dim}",
+        )
         if protect < 0.5 and pitch is not None and pitchf is not None:
             feats0 = feats.clone()
         if (
@@ -204,7 +185,7 @@ class Pipeline:
             arg = (feats, p_len, pitch, pitchf, sid) if hasp else (feats, p_len, sid)
             audio1 = (net_g.infer(*arg)[0][0, 0]).detach().cpu().float().numpy()
             del hasp, arg
-        del feats, p_len, padding_mask
+        del feats, p_len
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         t2 = ttime()

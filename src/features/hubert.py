@@ -4,19 +4,85 @@ import torch
 import torch.nn.functional as F
 
 
-def read_wave_16k(wav_path, soundfile_module, normalize=False):
-    wav, sr = soundfile_module.read(wav_path)
-    if sr != 16000:
-        raise ValueError(f"{wav_path} sampling rate must be 16000, got {sr}")
-    feats = torch.from_numpy(wav).float()
+def prepare_hubert_waveform(
+    waveform,
+    normalize=False,
+    *,
+    source_label="audio",
+    mono_error_template="{label} must be mono after downmix, got dim={dim}",
+):
+    feats = torch.as_tensor(waveform).float()
     if feats.dim() == 2:
-        feats = feats.mean(-1)
+        if feats.shape[0] == 1:
+            feats = feats.squeeze(0)
+        else:
+            feats = feats.mean(-1)
     if feats.dim() != 1:
-        raise ValueError(f"{wav_path} must be mono after downmix, got dim={feats.dim()}")
+        raise ValueError(mono_error_template.format(label=source_label, dim=feats.dim()))
     if normalize:
         with torch.no_grad():
             feats = F.layer_norm(feats, feats.shape)
     return feats.view(1, -1)
+
+
+def build_hubert_inputs(
+    waveform,
+    device,
+    is_half,
+    *,
+    normalize=False,
+    source_label="audio",
+    mono_error_template="{label} must be mono after downmix, got dim={dim}",
+):
+    feats = prepare_hubert_waveform(
+        waveform,
+        normalize=normalize,
+        source_label=source_label,
+        mono_error_template=mono_error_template,
+    )
+    padding_mask = torch.BoolTensor(feats.shape).fill_(False)
+    source = feats.half() if is_half and torch.device(device).type != "cpu" else feats
+    return {
+        "source": source.to(device),
+        "padding_mask": padding_mask.to(device),
+    }
+
+
+def extract_hubert_features(
+    model,
+    waveform,
+    version,
+    device,
+    is_half,
+    *,
+    normalize=None,
+    source_label="audio",
+    mono_error_template="{label} must be mono after downmix, got dim={dim}",
+):
+    if normalize is None:
+        normalize = bool(getattr(model, "task_normalize", False))
+    if version not in {"v1", "v2"}:
+        raise ValueError(f"Unsupported HuBERT feature version: {version}")
+
+    inputs = build_hubert_inputs(
+        waveform,
+        device,
+        is_half,
+        normalize=normalize,
+        source_label=source_label,
+        mono_error_template=mono_error_template,
+    )
+    inputs["output_layer"] = 9 if version == "v1" else 12
+    with torch.no_grad():
+        logits = model.extract_features(**inputs)
+        return model.final_proj(logits[0]) if version == "v1" else logits[0]
+
+
+def read_wave_16k(wav_path, soundfile_module, normalize=False):
+    wav, sr = soundfile_module.read(wav_path)
+    if sr != 16000:
+        raise ValueError(f"{wav_path} sampling rate must be 16000, got {sr}")
+    return prepare_hubert_waveform(wav, normalize=normalize, source_label=str(wav_path))
 
 
 def load_hubert_model(model_path, device, is_half, log_fn=None):

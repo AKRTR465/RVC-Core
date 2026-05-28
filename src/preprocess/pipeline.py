@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import multiprocessing
-import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
 
 from configs.project_config import load_project_config, parse_hparams_overrides
+from src.preprocess.common import log_message, run_worker_shards
 from src.preprocess import f0 as f0_stage
 
 
@@ -36,14 +35,6 @@ class DatasetItem:
     source_path: Path
     speaker_id: int
     index: int
-
-
-def _log_message(message: str, log_path: str | Path | None = None) -> None:
-    print(message)
-    if log_path is not None:
-        with open(log_path, "a+", encoding="utf-8") as handle:
-            handle.write(f"{message}\n")
-            handle.flush()
 
 
 def parse_stage_list(raw_stages: str | None) -> tuple[str, ...]:
@@ -215,7 +206,8 @@ def write_preprocess_manifest(
     manifest_path = Path(preprocess_dir) / MANIFEST_NAME
     payload = "\n".join(json.dumps(record, ensure_ascii=False) for record in records)
     manifest_path.write_text(f"{payload}\n", encoding="utf-8")
-    _log_message(f"wrote manifest rows={len(records)}: {manifest_path}")
+    log_path = manifest_path.parent / "preprocess.log"
+    log_message(log_path, f"wrote manifest rows={len(records)}: {manifest_path}")
     return manifest_path
 
 
@@ -325,7 +317,7 @@ def _build_filelist_rows(
     project: dict,
     records: list[dict],
 ) -> tuple[list[str], int]:
-    preprocess_dir = Path(project["preprocess_dir"])
+    preprocess_dir = Path(project["paths"]["preprocess_dir"])
     feature_dir = _feature_dir(project, preprocess_dir)
     use_f0 = _if_f0(project) == 1
     rows: list[str] = []
@@ -448,7 +440,7 @@ def split_filelist_rows(
 
 
 def generate_filelist(project: dict) -> tuple[Path, int, int]:
-    preprocess_dir = Path(project["preprocess_dir"])
+    preprocess_dir = Path(project["paths"]["preprocess_dir"])
     try:
         records = load_preprocess_manifest(preprocess_dir)
     except FileNotFoundError:
@@ -485,7 +477,8 @@ def generate_filelist(project: dict) -> tuple[Path, int, int]:
 
 
 def _resolve_audio_workers(project: dict, workers_override: int | None) -> int:
-    return int(workers_override if workers_override is not None else project["n_cpu"])
+    runtime = project["runtime"]
+    return int(workers_override if workers_override is not None else runtime["n_cpu"])
 
 
 def _resolve_f0_workers(
@@ -495,14 +488,15 @@ def _resolve_f0_workers(
 ) -> int:
     if workers_override is not None:
         return int(workers_override)
-    return 1 if f0method == "rmvpe" else int(project["n_cpu"])
+    return 1 if f0method == "rmvpe" else int(project["runtime"]["n_cpu"])
 
 
 def run_audio_stage(project: dict, workers_override: int | None = None) -> Path:
-    preprocess_dir = Path(project["preprocess_dir"])
+    paths = project["paths"]
+    preprocess_dir = Path(paths["preprocess_dir"])
     preprocess_dir.mkdir(parents=True, exist_ok=True)
 
-    items = discover_dataset_items(project["dataset_dir"], _speaker_embed_dim(project))
+    items = discover_dataset_items(paths["dataset_dir"], _speaker_embed_dim(project))
     sampling_rate = int(project["data"]["sampling_rate"])
     preprocess_config = project.get("preprocess", {})
     workers = min(_resolve_audio_workers(project, workers_override), len(items))
@@ -510,42 +504,24 @@ def run_audio_stage(project: dict, workers_override: int | None = None) -> Path:
     noparallel = bool(preprocess_config.get("noparallel", False))
     log_path = preprocess_dir / "preprocess.log"
 
-    _log_message(
+    log_message(
+        log_path,
         f"start audio preprocess, items={len(items)}, workers={workers}, "
         f"noparallel={noparallel}, mode=prepared-audio",
-        log_path,
     )
 
     payload = [(str(item.source_path), item.index) for item in items]
-    if noparallel or workers == 1:
-        _run_audio_items_worker(
-            payload,
-            sampling_rate,
-            str(preprocess_dir),
-        )
-    else:
-        processes: list[multiprocessing.Process] = []
-        for worker_index in range(workers):
-            process = multiprocessing.Process(
-                target=_run_audio_items_worker,
-                args=(
-                    payload[worker_index::workers],
-                    sampling_rate,
-                    str(preprocess_dir),
-                ),
-            )
-            processes.append(process)
-            process.start()
-
-        for process in processes:
-            process.join()
-            if process.exitcode != 0:
-                raise RuntimeError(
-                    f"audio preprocess worker {process.pid} exited with {process.exitcode}"
-                )
+    run_worker_shards(
+        payload,
+        workers,
+        _run_audio_items_worker,
+        lambda shard: (shard, sampling_rate, str(preprocess_dir)),
+        error_label="audio preprocess worker",
+        parallel=not noparallel,
+    )
 
     manifest_path = write_preprocess_manifest(items, preprocess_dir)
-    _log_message("end audio preprocess", log_path)
+    log_message(log_path, "end audio preprocess")
     return manifest_path
 
 
@@ -561,63 +537,48 @@ def run_f0_stage(
     if f0method not in F0_METHODS:
         raise ValueError(f"Unsupported f0method={f0method!r}")
 
-    exp_dir = Path(project["preprocess_dir"])
+    paths_config = project["paths"]
+    exp_dir = Path(paths_config["preprocess_dir"])
     exp_dir.mkdir(parents=True, exist_ok=True)
     log_path = exp_dir / "extract_f0_feature.log"
     workers = _resolve_f0_workers(project, f0method, workers_override)
+    runtime = project["runtime"]
 
     i_gpu = ""
-    device_request = str(project["device"])
+    device_request = str(runtime["device"])
     if device_request.startswith("cuda:"):
         i_gpu = device_request.split(":", 1)[1]
 
     runtime_args = argparse.Namespace(
         f0method=f0method,
         i_gpu=i_gpu,
-        is_half=bool(project["is_half"]),
+        is_half=bool(runtime["is_half"]),
     )
     device, is_half, _ = f0_stage.resolve_runtime(runtime_args, log_path)
-    pretrain_root = str(
-        project.get("pretrain_root", os.getenv("pretrain_root", "pretrain"))
-    )
+    pretrain_root = str(paths_config["pretrain_root"])
     paths = f0_stage.build_paths(exp_dir)
 
-    f0_stage.log_message(
+    log_message(
         log_path,
         f"pipeline-f0,method={f0method},workers={workers},device={device},is_half={is_half}",
     )
-    if workers == 1:
-        f0_stage.run_worker(paths, f0method, device, is_half, pretrain_root, log_path)
-        return
-
-    processes: list[multiprocessing.Process] = []
-    for worker_index in range(workers):
-        process = multiprocessing.Process(
-            target=f0_stage.run_worker,
-            args=(
-                paths[worker_index::workers],
-                f0method,
-                device,
-                is_half,
-                pretrain_root,
-                log_path,
-            ),
-        )
-        processes.append(process)
-        process.start()
-
-    for process in processes:
-        process.join()
-        if process.exitcode != 0:
-            raise RuntimeError(f"f0 worker {process.pid} exited with code {process.exitcode}")
+    run_worker_shards(
+        paths,
+        workers,
+        f0_stage.run_worker,
+        lambda shard: (shard, f0method, device, is_half, pretrain_root, log_path),
+        error_label="f0 worker",
+    )
 
 
 def run_feature_stage(project: dict) -> None:
     from src.preprocess import features as feature_stage
 
-    exp_dir = Path(project["preprocess_dir"])
+    paths = project["paths"]
+    exp_dir = Path(paths["preprocess_dir"])
     exp_dir.mkdir(parents=True, exist_ok=True)
-    device_request = str(project["device"])
+    runtime = project["runtime"]
+    device_request = str(runtime["device"])
     device = feature_stage.resolve_device(
         device_request if device_request.startswith("cuda") else "cpu"
     )
@@ -627,8 +588,8 @@ def run_feature_stage(project: dict) -> None:
         n_part=1,
         i_part=0,
         device=device,
-        is_half=bool(project["is_half"]),
-        model_path=str(project["hubert_path"]),
+        is_half=bool(runtime["is_half"]),
+        model_path=str(paths["hubert_path"]),
         log_path=exp_dir / "extract_f0_feature.log",
     )
 

@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 
 F0_MIN = 50.0
@@ -79,6 +81,50 @@ def load_rmvpe_model(model_path, device, is_half, log_fn=None):
     if log_fn is not None:
         log_fn(f"Loading rmvpe model,{model_path}")
     return RMVPE(model_path, is_half=is_half, device=device)
+
+
+def compute_f0_by_method(
+    x,
+    sr,
+    p_len,
+    hop_size,
+    method,
+    *,
+    device="cpu",
+    is_half=False,
+    pretrain_root="pretrain",
+    rmvpe_path=None,
+    rmvpe_model=None,
+    log_fn=None,
+    f0_min=F0_MIN,
+    f0_max=F0_MAX,
+):
+    if method == "pm":
+        return (
+            compute_pm_f0(x, sr, p_len, f0_min=f0_min, f0_max=f0_max, hop_size=hop_size),
+            rmvpe_model,
+        )
+    if method in {"harvest", "dio"}:
+        return (
+            compute_world_f0(x, sr, hop_size, method, f0_min=f0_min, f0_max=f0_max),
+            rmvpe_model,
+        )
+    if method == "crepe":
+        return (
+            compute_crepe_f0(x, sr, hop_size, device, f0_min=f0_min, f0_max=f0_max),
+            rmvpe_model,
+        )
+    if method == "rmvpe":
+        model = rmvpe_model
+        if model is None:
+            model = load_rmvpe_model(
+                rmvpe_path or os.path.join(pretrain_root, "rmvpe", "rmvpe.pt"),
+                device,
+                is_half,
+                log_fn,
+            )
+        return model.infer_from_audio(x, thred=0.03), model
+    raise ValueError(f"Unsupported f0 method: {method}")
 
 
 def f0_to_coarse(f0, f0_min=F0_MIN, f0_max=F0_MAX, f0_bin=F0_BIN):
