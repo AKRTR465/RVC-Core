@@ -5,7 +5,7 @@ import numpy as np
 F0_MIN = 50.0
 F0_MAX = 1100.0
 F0_BIN = 256
-F0_METHODS = ("pm", "harvest", "dio", "rmvpe", "crepe")
+F0_METHODS = ("pm", "rmvpe", "crepe")
 
 
 def compute_pm_f0(x, sr, p_len, f0_min=F0_MIN, f0_max=F0_MAX, hop_size=160):
@@ -26,32 +26,6 @@ def compute_pm_f0(x, sr, p_len, f0_min=F0_MIN, f0_max=F0_MAX, hop_size=160):
     if pad_size > 0 or p_len - len(f0) - pad_size > 0:
         f0 = np.pad(f0, [[pad_size, p_len - len(f0) - pad_size]], mode="constant")
     return f0
-
-
-def compute_world_f0(x, sr, hop_size, method, f0_min=F0_MIN, f0_max=F0_MAX):
-    import pyworld
-
-    audio = x.astype(np.double)
-    frame_period = 1000 * hop_size / sr
-    if method == "harvest":
-        f0, t = pyworld.harvest(
-            audio,
-            fs=sr,
-            f0_ceil=f0_max,
-            f0_floor=f0_min,
-            frame_period=frame_period,
-        )
-    elif method == "dio":
-        f0, t = pyworld.dio(
-            audio,
-            fs=sr,
-            f0_ceil=f0_max,
-            f0_floor=f0_min,
-            frame_period=frame_period,
-        )
-    else:
-        raise ValueError(f"Unsupported pyworld f0 method: {method}")
-    return pyworld.stonemask(audio, f0, t, sr)
 
 
 def compute_crepe_f0(x, sr, hop_size, device, f0_min=F0_MIN, f0_max=F0_MAX):
@@ -105,11 +79,6 @@ def compute_f0_by_method(
     if method == "pm":
         return (
             compute_pm_f0(x, sr, p_len, f0_min=f0_min, f0_max=f0_max, hop_size=hop_size),
-            rmvpe_model,
-        )
-    if method in {"harvest", "dio"}:
-        return (
-            compute_world_f0(x, sr, hop_size, method, f0_min=f0_min, f0_max=f0_max),
             rmvpe_model,
         )
     if method == "crepe":

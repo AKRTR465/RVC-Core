@@ -4,7 +4,6 @@ numpy==1.23.5
 scipy
 llvmlite==0.39.0
 faiss-cpu==1.7.3
-Cython
 matplotlib>=3.7.0
 praat-parselmouth>=0.4.2
 resampy>=0.4.2
@@ -14,6 +13,5 @@ tqdm>=4.63.1
 PyYAML>=6.0
 pyasn1>=0.4.8
 pyasn1-modules>=0.2.8
-pyworld==0.3.2
 torchcrepe==0.0.20
 python-dotenv>=1.0.0

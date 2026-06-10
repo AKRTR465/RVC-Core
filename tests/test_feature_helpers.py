@@ -226,8 +226,8 @@ class HubertHelperTest(unittest.TestCase):
 
 
 class F0HelperTest(unittest.TestCase):
-    def test_supported_f0_methods_include_crepe(self):
-        self.assertIn("crepe", feature_f0.F0_METHODS)
+    def test_supported_f0_methods_exclude_world_paths(self):
+        self.assertEqual(feature_f0.F0_METHODS, ("pm", "rmvpe", "crepe"))
 
     def test_compute_f0_by_method_uses_existing_rmvpe_model(self):
         model = mock.Mock()
@@ -271,29 +271,17 @@ class F0HelperTest(unittest.TestCase):
         self.assertIs(returned_model, model)
         np.testing.assert_array_equal(f0, np.array([456.0], dtype=np.float32))
 
-    def test_compute_f0_by_method_dispatches_world_methods(self):
-        with mock.patch(
-            "src.features.f0.compute_world_f0",
-            return_value=np.array([1.0, 2.0], dtype=np.float32),
-        ) as compute_world:
-            f0, returned_model = feature_f0.compute_f0_by_method(
-                np.ones(10, dtype=np.float32),
-                16000,
-                1,
-                160,
-                "harvest",
-            )
-
-        compute_world.assert_called_once_with(
-            mock.ANY,
-            16000,
-            160,
-            "harvest",
-            f0_min=feature_f0.F0_MIN,
-            f0_max=feature_f0.F0_MAX,
-        )
-        self.assertIsNone(returned_model)
-        np.testing.assert_array_equal(f0, np.array([1.0, 2.0], dtype=np.float32))
+    def test_compute_f0_by_method_rejects_removed_world_methods(self):
+        for method in ("harvest", "dio"):
+            with self.subTest(method=method):
+                with self.assertRaisesRegex(ValueError, "Unsupported f0 method"):
+                    feature_f0.compute_f0_by_method(
+                        np.ones(10, dtype=np.float32),
+                        16000,
+                        1,
+                        160,
+                        method,
+                    )
 
     def test_compute_f0_by_method_dispatches_crepe(self):
         with mock.patch(

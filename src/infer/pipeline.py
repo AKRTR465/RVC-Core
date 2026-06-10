@@ -91,9 +91,6 @@ class Pipeline:
             f0_min=F0_MIN,
             f0_max=F0_MAX,
         )
-        if f0_method == "harvest" and filter_radius > 2:
-            f0 = signal.medfilt(f0, 3)
-
         f0 = f0.astype(np.float64, copy=True)
         f0 *= pow(2, f0_up_key / 12)
         tf0 = self.sr // self.window

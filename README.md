@@ -176,7 +176,7 @@ python -m src.preprocess --config configs/mute.yaml --hparams preprocess.noparal
 RMVPE 默认只使用 1 个 F0 worker；也可以临时切换 F0 方法：
 
 ```bash
-python -m src.preprocess --config configs/mute.yaml --f0method harvest
+python -m src.preprocess --config configs/mute.yaml --f0method rmvpe
 ```
 
 只补跑某个阶段时使用 `--stages`，例如只重建 filelist：
