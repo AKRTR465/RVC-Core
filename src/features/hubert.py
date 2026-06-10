@@ -1,8 +1,10 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 import torch.nn.functional as F
+from scipy.io import wavfile as scipy_wavfile
 
 from src.features.hubert_fairseq_compat import (
     build_hubert_model_from_checkpoint,
@@ -84,11 +86,25 @@ def extract_hubert_features(
         return model.final_proj(logits[0]) if version == "v1" else logits[0]
 
 
-def read_wave_16k(wav_path, soundfile_module):
-    wav, sr = soundfile_module.read(wav_path)
+def _pcm_to_float_array(wav):
+    wav = np.asarray(wav)
+    if np.issubdtype(wav.dtype, np.floating):
+        return wav.astype(np.float32, copy=False)
+    if wav.dtype == np.uint8:
+        return ((wav.astype(np.float32) - 128.0) / 128.0).astype(np.float32, copy=False)
+    if np.issubdtype(wav.dtype, np.integer):
+        info = np.iinfo(wav.dtype)
+        scale = float(max(abs(info.min), info.max))
+        return (wav.astype(np.float32) / scale).astype(np.float32, copy=False)
+    raise ValueError(f"Unsupported WAV dtype: {wav.dtype}")
+
+
+def read_wave_16k(wav_path, wavfile_module=None):
+    wavfile_module = wavfile_module or scipy_wavfile
+    sr, wav = wavfile_module.read(wav_path)
     if sr != 16000:
         raise ValueError(f"{wav_path} sampling rate must be 16000, got {sr}")
-    return wav
+    return _pcm_to_float_array(wav)
 
 
 def _torch_load_trusted_checkpoint(model_path):

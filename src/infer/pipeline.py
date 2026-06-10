@@ -18,17 +18,14 @@ from src.features.f0 import (
 )
 from src.features.hubert import extract_hubert_features
 from src.index.retrieval import blend_search_features, load_retrieval_index
+from src.utils.audio import audio_rms, resample_audio
 
 bh, ah = signal.butter(N=5, Wn=48, btype="high", fs=16000)
 
 
 def change_rms(data1, sr1, data2, sr2, rate):
-    import librosa
-
-    rms1 = librosa.feature.rms(
-        y=data1, frame_length=sr1 // 2 * 2, hop_length=sr1 // 2
-    )
-    rms2 = librosa.feature.rms(y=data2, frame_length=sr2 // 2 * 2, hop_length=sr2 // 2)
+    rms1 = audio_rms(data1, frame_length=sr1 // 2 * 2, hop_length=sr1 // 2)
+    rms2 = audio_rms(data2, frame_length=sr2 // 2 * 2, hop_length=sr2 // 2)
     rms1 = torch.from_numpy(rms1)
     rms1 = F.interpolate(
         rms1.unsqueeze(0), size=data2.shape[0], mode="linear"
@@ -365,11 +362,7 @@ class Pipeline:
         if rms_mix_rate != 1:
             audio_opt = change_rms(audio, 16000, audio_opt, tgt_sr, rms_mix_rate)
         if tgt_sr != resample_sr >= 16000:
-            import librosa
-
-            audio_opt = librosa.resample(
-                audio_opt, orig_sr=tgt_sr, target_sr=resample_sr
-            )
+            audio_opt = resample_audio(audio_opt, orig_sr=tgt_sr, target_sr=resample_sr)
         audio_max = np.abs(audio_opt).max() / 0.99
         max_int16 = 32768
         if audio_max > 1:

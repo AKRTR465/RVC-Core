@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 
 import numpy as np
-import soundfile as sf
 import torch
 
 from src.features.hubert import extract_hubert_features
@@ -66,7 +65,7 @@ def extract_features(
             if out_path.exists():
                 continue
 
-            waveform = read_wave_16k(wav_path, sf)
+            waveform = read_wave_16k(wav_path)
             feats = extract_hubert_features(
                 model,
                 waveform,
@@ -87,7 +86,7 @@ def extract_features(
                     layout.feature_log_path,
                     f"now-{idx},all-{len(todo)},{file},{feature_npy.shape}",
                 )
-        except (OSError, RuntimeError, ValueError, sf.SoundFileError) as exc:
+        except (OSError, RuntimeError, ValueError) as exc:
             failures += 1
             log_message(
                 layout.feature_log_path,

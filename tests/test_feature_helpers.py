@@ -171,17 +171,31 @@ class HubertHelperTest(unittest.TestCase):
         self.assertTrue(torch.equal(output, expected))
 
     def test_read_wave_16k_returns_raw_waveform_before_feature_prep(self):
-        soundfile_module = mock.Mock()
-        soundfile_module.read.return_value = (
-            np.array([[1.0, 3.0], [5.0, 7.0]], dtype=np.float32),
+        wavfile_module = mock.Mock()
+        wavfile_module.read.return_value = (
             16000,
+            np.array([[1.0, 3.0], [5.0, 7.0]], dtype=np.float32),
         )
 
-        waveform = feature_hubert.read_wave_16k("demo.wav", soundfile_module)
+        waveform = feature_hubert.read_wave_16k("demo.wav", wavfile_module)
 
         np.testing.assert_array_equal(
             waveform,
             np.array([[1.0, 3.0], [5.0, 7.0]], dtype=np.float32),
+        )
+
+    def test_read_wave_16k_converts_pcm_to_float(self):
+        wavfile_module = mock.Mock()
+        wavfile_module.read.return_value = (
+            16000,
+            np.array([-32768, 0, 32767], dtype=np.int16),
+        )
+
+        waveform = feature_hubert.read_wave_16k("demo.wav", wavfile_module)
+
+        np.testing.assert_allclose(
+            waveform,
+            np.array([-1.0, 0.0, 32767 / 32768], dtype=np.float32),
         )
 
     def test_read_wave_16k_extract_chain_normalizes_once(self):
@@ -195,10 +209,10 @@ class HubertHelperTest(unittest.TestCase):
             def final_proj(self, tensor):
                 return tensor
 
-        soundfile_module = mock.Mock()
-        soundfile_module.read.return_value = (np.array([1.0, 2.0], dtype=np.float32), 16000)
+        wavfile_module = mock.Mock()
+        wavfile_module.read.return_value = (16000, np.array([1.0, 2.0], dtype=np.float32))
 
-        waveform = feature_hubert.read_wave_16k("demo.wav", soundfile_module)
+        waveform = feature_hubert.read_wave_16k("demo.wav", wavfile_module)
         output = feature_hubert.extract_hubert_features(
             FakeModel(),
             waveform,

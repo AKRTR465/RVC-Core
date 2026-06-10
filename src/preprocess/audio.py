@@ -8,6 +8,7 @@ from scipy.io import wavfile
 
 from src.preprocess.common import log_message
 from src.preprocess.layout import GT_WAV_DIR_NAME, PREPROCESS_LOG_NAME, WAV16K_DIR_NAME
+from src.utils.audio import resample_audio
 
 
 class AudioPreprocessor:
@@ -45,9 +46,7 @@ class AudioPreprocessor:
             self.sr,
             tmp_audio.astype(np.float32),
         )
-        import librosa
-
-        tmp_audio = librosa.resample(tmp_audio, orig_sr=self.sr, target_sr=16000)
+        tmp_audio = resample_audio(tmp_audio, orig_sr=self.sr, target_sr=16000)
         wavfile.write(
             self.wavs16k_dir / f"{idx0}_{idx1}.wav",
             16000,

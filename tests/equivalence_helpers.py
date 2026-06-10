@@ -23,28 +23,6 @@ def patched_argv(argv):
 
 
 @contextlib.contextmanager
-def fake_librosa():
-    old_librosa = sys.modules.get("librosa")
-
-    def resample(audio, orig_sr, target_sr):
-        if orig_sr == target_sr:
-            return np.asarray(audio).copy()
-        old_x = np.linspace(0.0, 1.0, len(audio), endpoint=False)
-        new_len = int(round(len(audio) * float(target_sr) / float(orig_sr)))
-        new_x = np.linspace(0.0, 1.0, new_len, endpoint=False)
-        return np.interp(new_x, old_x, audio).astype(np.asarray(audio).dtype)
-
-    sys.modules["librosa"] = types.SimpleNamespace(resample=resample)
-    try:
-        yield
-    finally:
-        if old_librosa is None:
-            sys.modules.pop("librosa", None)
-        else:
-            sys.modules["librosa"] = old_librosa
-
-
-@contextlib.contextmanager
 def make_temp_dir():
     TMP_ROOT.mkdir(parents=True, exist_ok=True)
     while True:
