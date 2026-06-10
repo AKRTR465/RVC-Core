@@ -18,7 +18,7 @@ class PreprocessCliArgsTest(unittest.TestCase):
         self.assertEqual(exc.exception.code, 2)
         self.assertRegex(stderr.getvalue(), pattern)
 
-    def test_main_accepts_config_mode_and_crepe_override(self):
+    def test_main_accepts_config_mode_and_rmvpe_override(self):
         project = {
             "paths": {
                 "dataset_dir": "data/dataset",
@@ -41,7 +41,7 @@ class PreprocessCliArgsTest(unittest.TestCase):
                     "--config",
                     "project.yaml",
                     "--f0method",
-                    "crepe",
+                    "rmvpe",
                     "--workers",
                     "3",
                     "--device",
@@ -52,10 +52,16 @@ class PreprocessCliArgsTest(unittest.TestCase):
         run_pipeline.assert_called_once_with(
             project,
             preprocess_pipeline.DEFAULT_STAGES,
-            "crepe",
+            "rmvpe",
             3,
             device_override="cpu",
             is_half_override=None,
+        )
+
+    def test_main_rejects_removed_crepe_f0_method(self):
+        self.assert_parse_error(
+            ["--config", "project.yaml", "--f0method", "crepe"],
+            r"invalid choice: 'crepe'",
         )
 
     def test_main_allows_is_half_override(self):

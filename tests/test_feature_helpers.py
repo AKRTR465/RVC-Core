@@ -226,8 +226,8 @@ class HubertHelperTest(unittest.TestCase):
 
 
 class F0HelperTest(unittest.TestCase):
-    def test_supported_f0_methods_exclude_world_paths(self):
-        self.assertEqual(feature_f0.F0_METHODS, ("pm", "rmvpe", "crepe"))
+    def test_supported_f0_methods_only_include_rmvpe(self):
+        self.assertEqual(feature_f0.F0_METHODS, ("rmvpe",))
 
     def test_compute_f0_by_method_uses_existing_rmvpe_model(self):
         model = mock.Mock()
@@ -271,8 +271,8 @@ class F0HelperTest(unittest.TestCase):
         self.assertIs(returned_model, model)
         np.testing.assert_array_equal(f0, np.array([456.0], dtype=np.float32))
 
-    def test_compute_f0_by_method_rejects_removed_world_methods(self):
-        for method in ("harvest", "dio"):
+    def test_compute_f0_by_method_rejects_removed_f0_methods(self):
+        for method in ("pm", "crepe", "harvest", "dio"):
             with self.subTest(method=method):
                 with self.assertRaisesRegex(ValueError, "Unsupported f0 method"):
                     feature_f0.compute_f0_by_method(
@@ -282,31 +282,6 @@ class F0HelperTest(unittest.TestCase):
                         160,
                         method,
                     )
-
-    def test_compute_f0_by_method_dispatches_crepe(self):
-        with mock.patch(
-            "src.features.f0.compute_crepe_f0",
-            return_value=np.array([3.0, 4.0], dtype=np.float32),
-        ) as compute_crepe:
-            f0, returned_model = feature_f0.compute_f0_by_method(
-                np.ones(10, dtype=np.float32),
-                16000,
-                1,
-                160,
-                "crepe",
-                device="cuda:0",
-            )
-
-        compute_crepe.assert_called_once_with(
-            mock.ANY,
-            16000,
-            160,
-            "cuda:0",
-            f0_min=feature_f0.F0_MIN,
-            f0_max=feature_f0.F0_MAX,
-        )
-        self.assertIsNone(returned_model)
-        np.testing.assert_array_equal(f0, np.array([3.0, 4.0], dtype=np.float32))
 
     def test_f0_to_coarse_returns_int_bins(self):
         coarse = feature_f0.f0_to_coarse(np.array([110.0, 220.0], dtype=np.float32))

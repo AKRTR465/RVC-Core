@@ -177,7 +177,7 @@ class PreprocessPipelineTest(unittest.TestCase):
             write_manifest.assert_called_once()
             self.assertTrue(str(manifest_path).endswith("preprocess_manifest.jsonl"))
 
-    def test_run_f0_stage_supports_crepe_and_device_override(self):
+    def test_run_f0_stage_supports_rmvpe_and_device_override(self):
         with make_temp_dir() as tmp:
             tmp_root = Path(tmp)
             project = project_for(tmp_root, tmp_root / "preprocess")
@@ -191,7 +191,7 @@ class PreprocessPipelineTest(unittest.TestCase):
             ), mock.patch("src.preprocess.pipeline.run_worker_shards") as run_shards:
                 run_f0_stage(
                     project,
-                    "crepe",
+                    "rmvpe",
                     workers_override=2,
                     device_override="cuda:0",
                 )

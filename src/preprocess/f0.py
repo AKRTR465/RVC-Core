@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 import os
 from pathlib import Path
 
@@ -16,8 +15,6 @@ from src.features.f0 import (
 )
 from src.preprocess.common import log_message
 from src.preprocess.layout import PreprocessLayout
-
-logging.getLogger("numba").setLevel(logging.WARNING)
 
 
 def detect_cuda_profile():
@@ -151,40 +148,29 @@ def resolve_runtime(
 
     requested = str(device_request).strip().lower()
     if requested in {"", "auto"}:
-        requested = "cuda" if f0_method in {"rmvpe", "crepe"} else "cpu"
+        requested = "cuda"
 
-    if f0_method in {"rmvpe", "crepe"}:
-        try:
-            import torch
-        except ImportError:
-            torch = None
+    try:
+        import torch
+    except ImportError:
+        torch = None
 
-        if requested.startswith("cuda") or requested == "cuda":
-            if torch is None or not torch.cuda.is_available():
-                log_message(log_path, f"{f0_method}-gpu-request-fell-back-to-cpu")
-                return "cpu", False
-            if f0_method == "crepe":
-                if is_half_request:
-                    log_message(log_path, "crepe-ignoring-is-half")
-                return requested if requested != "cuda" else "cuda", False
+    if requested.startswith("cuda") or requested == "cuda":
+        if torch is None or not torch.cuda.is_available():
+            log_message(log_path, f"{f0_method}-gpu-request-fell-back-to-cpu")
+            return "cpu", False
 
-            profile = detect_cuda_profile()
-            resolved_device = requested if requested != "cuda" else profile["device"]
-            if is_half_request and not profile["supports_half"]:
-                log_message(
-                    log_path,
-                    f"rmvpe-half-request-ignored-unsupported-gpu={profile['gpu_name']}",
-                )
-            return resolved_device, bool(is_half_request and profile["supports_half"])
+        profile = detect_cuda_profile()
+        resolved_device = requested if requested != "cuda" else profile["device"]
+        if is_half_request and not profile["supports_half"]:
+            log_message(
+                log_path,
+                f"rmvpe-half-request-ignored-unsupported-gpu={profile['gpu_name']}",
+            )
+        return resolved_device, bool(is_half_request and profile["supports_half"])
 
-        if is_half_request:
-            log_message(log_path, f"{f0_method}-cpu-mode-forces-fp32")
-        return "cpu", False
-
-    if requested.startswith("cuda"):
-        log_message(log_path, f"ignoring GPU runtime for f0method={f0_method}")
     if is_half_request:
-        log_message(log_path, f"ignoring --is-half for f0method={f0_method}")
+        log_message(log_path, f"{f0_method}-cpu-mode-forces-fp32")
     return "cpu", False
 
 
