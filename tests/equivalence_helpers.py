@@ -1,7 +1,6 @@
 import contextlib
 import os
 import sys
-import types
 import uuid
 from pathlib import Path
 
@@ -21,51 +20,6 @@ def patched_argv(argv):
         yield
     finally:
         sys.argv = old_argv
-
-
-@contextlib.contextmanager
-def fake_fairseq():
-    old_fairseq = sys.modules.get("fairseq")
-
-    class FakeModel:
-        def to(self, device):
-            self.device = device
-            return self
-
-        def half(self):
-            return self
-
-        def float(self):
-            return self
-
-        def eval(self):
-            return self
-
-        def extract_features(self, **inputs):
-            source = inputs["source"].float()
-            return (source.unsqueeze(-1),)
-
-        def final_proj(self, feats):
-            return feats
-
-    class FakeCheckpointUtils:
-        @staticmethod
-        def load_model_ensemble_and_task(paths, suffix=""):
-            saved_cfg = types.SimpleNamespace(
-                task=types.SimpleNamespace(normalize=False)
-            )
-            return [FakeModel()], saved_cfg, object()
-
-    sys.modules["fairseq"] = types.SimpleNamespace(
-        checkpoint_utils=FakeCheckpointUtils()
-    )
-    try:
-        yield
-    finally:
-        if old_fairseq is None:
-            sys.modules.pop("fairseq", None)
-        else:
-            sys.modules["fairseq"] = old_fairseq
 
 
 @contextlib.contextmanager

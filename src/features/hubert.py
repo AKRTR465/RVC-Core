@@ -1,7 +1,13 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 import torch.nn.functional as F
+
+from src.features.hubert_fairseq_compat import (
+    build_hubert_model_from_checkpoint,
+    checkpoint_cfg_to_namespace,
+)
 
 
 def prepare_hubert_waveform(
@@ -85,9 +91,18 @@ def read_wave_16k(wav_path, soundfile_module):
     return wav
 
 
-def load_hubert_model(model_path, device, is_half, log_fn=None):
-    import fairseq
+def _torch_load_trusted_checkpoint(model_path):
+    kwargs = {"map_location": "cpu", "weights_only": False}
+    try:
+        return torch.load(model_path, **kwargs)
+    except TypeError as exc:
+        if "weights_only" not in str(exc):
+            raise
+        kwargs.pop("weights_only", None)
+        return torch.load(model_path, **kwargs)
 
+
+def load_hubert_model(model_path, device, is_half, log_fn=None):
     if not Path(model_path).is_file():
         if log_fn is not None:
             log_fn(
@@ -99,33 +114,22 @@ def load_hubert_model(model_path, device, is_half, log_fn=None):
     if log_fn is not None:
         log_fn(f"load model(s) from {model_path}")
 
-    original_torch_load = torch.load
+    checkpoint = _torch_load_trusted_checkpoint(str(model_path))
+    if not isinstance(checkpoint, dict) or "model" not in checkpoint:
+        raise ValueError(f"HuBERT checkpoint does not contain a model state: {model_path}")
 
-    def torch_load_trusted_checkpoint(*args, **kwargs):
-        kwargs.setdefault("weights_only", False)
-        try:
-            return original_torch_load(*args, **kwargs)
-        except TypeError as exc:
-            if "weights_only" not in str(exc):
-                raise
-            kwargs.pop("weights_only", None)
-            return original_torch_load(*args, **kwargs)
+    cfg = checkpoint.get("cfg", {})
+    saved_cfg = checkpoint_cfg_to_namespace(cfg)
+    if not hasattr(saved_cfg, "task"):
+        saved_cfg.task = SimpleNamespace(normalize=False)
+    elif not hasattr(saved_cfg.task, "normalize"):
+        saved_cfg.task.normalize = False
 
-    torch.load = torch_load_trusted_checkpoint
-    try:
-        models, saved_cfg, _ = fairseq.checkpoint_utils.load_model_ensemble_and_task(
-            [str(model_path)],
-            suffix="",
-        )
-    finally:
-        torch.load = original_torch_load
-
-    model = models[0].to(device)
+    model = build_hubert_model_from_checkpoint(cfg, checkpoint["model"]).to(device)
     if log_fn is not None:
         log_fn(f"move model to {device}")
     if is_half and torch.device(device).type != "cpu":
         model = model.half()
     else:
         model = model.float()
-    model.task_normalize = bool(getattr(saved_cfg.task, "normalize", False))
     return model.eval(), saved_cfg

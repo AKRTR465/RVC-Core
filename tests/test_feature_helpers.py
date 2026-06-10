@@ -1,14 +1,112 @@
 import unittest
 from unittest import mock
+from pathlib import Path
 
 import numpy as np
 import torch
 
 from src.features import f0 as feature_f0
 from src.features import hubert as feature_hubert
+from src.features.hubert_fairseq_compat import HubertConfig, HubertModel
+from tests.equivalence_helpers import make_temp_dir
+
+
+def write_tiny_hubert_checkpoint(path, normalize=True, model_name="hubert"):
+    config = HubertConfig(
+        conv_layers=((4, 2, 2),),
+        encoder_layers=1,
+        encoder_embed_dim=4,
+        encoder_ffn_embed_dim=8,
+        encoder_attention_heads=2,
+        dropout=0.0,
+        attention_dropout=0.0,
+        activation_dropout=0.0,
+        encoder_layerdrop=0.0,
+        dropout_input=0.0,
+        dropout_features=0.0,
+        final_dim=3,
+        label_embs_num=5,
+        conv_pos=4,
+        conv_pos_groups=1,
+    )
+    model = HubertModel(config)
+    torch.save(
+        {
+            "cfg": {
+                "model": {
+                    "_name": model_name,
+                    "conv_feature_layers": repr(list(config.conv_layers)),
+                    "extractor_mode": config.extractor_mode,
+                    "conv_bias": config.conv_bias,
+                    "encoder_layers": config.encoder_layers,
+                    "encoder_embed_dim": config.encoder_embed_dim,
+                    "encoder_ffn_embed_dim": config.encoder_ffn_embed_dim,
+                    "encoder_attention_heads": config.encoder_attention_heads,
+                    "activation_fn": config.activation_fn,
+                    "layer_norm_first": config.layer_norm_first,
+                    "dropout": config.dropout,
+                    "attention_dropout": config.attention_dropout,
+                    "activation_dropout": config.activation_dropout,
+                    "encoder_layerdrop": config.encoder_layerdrop,
+                    "dropout_input": config.dropout_input,
+                    "dropout_features": config.dropout_features,
+                    "conv_pos": config.conv_pos,
+                    "conv_pos_groups": config.conv_pos_groups,
+                    "required_seq_len_multiple": config.required_seq_len_multiple,
+                },
+                "task": {"normalize": normalize},
+            },
+            "model": model.state_dict(),
+        },
+        path,
+    )
 
 
 class HubertHelperTest(unittest.TestCase):
+    def test_load_hubert_model_uses_internal_checkpoint_loader(self):
+        with make_temp_dir() as tmp:
+            checkpoint_path = Path(tmp) / "hubert_tiny.pt"
+            write_tiny_hubert_checkpoint(checkpoint_path, normalize=True)
+
+            logs = []
+            model, saved_cfg = feature_hubert.load_hubert_model(
+                checkpoint_path,
+                "cpu",
+                is_half=True,
+                log_fn=logs.append,
+            )
+
+        self.assertIsNotNone(model)
+        self.assertFalse(model.training)
+        self.assertTrue(model.task_normalize)
+        self.assertTrue(saved_cfg.task.normalize)
+        self.assertEqual(next(model.parameters()).dtype, torch.float32)
+        self.assertIn(f"load model(s) from {checkpoint_path}", logs)
+        self.assertIn("move model to cpu", logs)
+
+    def test_load_hubert_model_missing_file_returns_none(self):
+        with make_temp_dir() as tmp:
+            checkpoint_path = Path(tmp) / "missing.pt"
+            logs = []
+            model, saved_cfg = feature_hubert.load_hubert_model(
+                checkpoint_path,
+                "cpu",
+                is_half=False,
+                log_fn=logs.append,
+            )
+
+        self.assertIsNone(model)
+        self.assertIsNone(saved_cfg)
+        self.assertIn("does not exist", logs[0])
+
+    def test_load_hubert_model_rejects_unsupported_checkpoint(self):
+        with make_temp_dir() as tmp:
+            checkpoint_path = Path(tmp) / "unsupported.pt"
+            write_tiny_hubert_checkpoint(checkpoint_path, model_name="wav2vec2")
+
+            with self.assertRaisesRegex(ValueError, "Unsupported HuBERT checkpoint model"):
+                feature_hubert.load_hubert_model(checkpoint_path, "cpu", is_half=False)
+
     def test_prepare_hubert_waveform_downmixes_and_batches(self):
         waveform = np.array([[1.0, 3.0], [5.0, 7.0]], dtype=np.float32)
 
